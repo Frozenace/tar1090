@@ -20,6 +20,11 @@ elif [[ -d "$HTML_PATH/db-$DB_VERSION" ]]; then
     sudo cp -r -T "$HTML_PATH/db-$DB_VERSION" "$TMP/db-$DB_VERSION"
 fi
 
+# Carto basemap key lives outside the repo (never committed): /etc/tar1090-carto.key
+if [[ -r /etc/tar1090-carto.key ]]; then
+    printf '\ncarto_api_key = "%s";\n' "$(sudo cat /etc/tar1090-carto.key)" | sudo tee -a "$TMP/config.js" >/dev/null
+fi
+
 sudo sed -i -e "s/let databaseFolder = .*;/let databaseFolder = \"db-$DB_VERSION\";/" "$TMP/index.html"
 echo "{ \"tar1090Version\": \"$TAR_VERSION\", \"databaseVersion\": \"$DB_VERSION\" }" | sudo tee "$TMP/version.json" >/dev/null
 

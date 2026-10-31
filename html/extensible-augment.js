@@ -1250,6 +1250,7 @@
                 <span class="thud-stat">📡 Max: <b>${bench.max_range_nm || "--"} NM</b></span>
                 <span class="thud-stat">⚡ <b>${bench.msg_rate || "--"}</b> msg/s</span>
                 <span class="thud-stat">SNR: <b>${bench.snr_db || "--"} dB</b></span>
+                <span class="thud-stat" title="Strong-signal share of decoded messages. >3% = front-end overload, <0.5% = headroom">🎚 ${bench.gain_db || "--"} dB · <b>${bench.strong_pct != null ? bench.strong_pct : "--"}%</b> strong · ${bench.gain_hint || ""}</span>
                 ${furthestHtml}
                 <button class="thud-btn ${TacticalEngine.polarOpen ? "active" : ""}" id="thud-polar-btn">📊 Polar</button>
                 <button class="thud-btn" id="thud-collapse" title="Minimize HUD">▴</button>

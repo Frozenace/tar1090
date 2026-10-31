@@ -54,6 +54,41 @@ FALLBACK_ENDPOINTS = [
     ("adsb_lol_regional", f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200"),
 ]
 
+PLANE_ALERT_CSV = os.environ.get("PLANE_ALERT_CSV", "/usr/local/share/tar1090/plane-alert/plane-alert-db.csv")
+
+
+def load_plane_alert() -> Dict[str, Dict[str, str]]:
+    """Load sdr-enthusiasts/plane-alert-db (hex -> tactical category) if present."""
+    import csv
+    db: Dict[str, Dict[str, str]] = {}
+    try:
+        with open(PLANE_ALERT_CSV, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            rd = csv.reader(f)
+            next(rd, None)
+            for r in rd:
+                if len(r) < 10:
+                    continue
+                cmpg, cat = r[5].strip(), r[9].strip()
+                tags = " ".join(r[6:9]).lower()
+                if cmpg == "Pol":
+                    tac = "NPAS"
+                elif cat == "Coastguard":
+                    tac = "SAR"
+                elif cat == "Flying Doctors" or "air ambo" in tags or "medical evac" in tags:
+                    tac = "HEMS"
+                elif cmpg == "Mil":
+                    tac = "MIL"
+                else:
+                    continue
+                db[r[0].strip().lower()] = {"cat": tac, "reg": r[1].strip(), "op": r[2].strip(),
+                                            "desc": r[3].strip(), "type": r[4].strip()}
+    except Exception:
+        pass
+    return db
+
+
+PLANE_ALERT: Dict[str, Dict[str, str]] = load_plane_alert()
+
 # Extensible UK & NATO Tactical Rules
 NPAS_REG_PREFIXES = ("G-POL", "G-NPA", "G-MPS", "G-PSN")
 NPAS_CALL_PREFIXES = ("UKP", "NPAS", "POLICE", "POL")
@@ -134,6 +169,23 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
     own_op = str(ac.get("ownOp", "") or "").strip()
     own_op_up = own_op.upper()
     db_flags = int(ac.get("dbFlags", 0) or 0)
+
+    # 0. Curated plane-alert-db match (authoritative hex lookup)
+    pa = PLANE_ALERT.get(hx)
+    if pa:
+        reg = reg or pa["reg"].upper()
+        t = t or pa["type"].upper()
+        desc = desc or pa["desc"]
+        own_op = own_op or pa["op"]
+        meta = {
+            "NPAS": ("NPAS Police Air Service", "#38bdf8"),
+            "HEMS": ("Air Ambulance (HEMS)", "#ef4444"),
+            "SAR": ("HM Coastguard / Search & Rescue", "#f97316"),
+            "MIL": ("Military (RAF / USAF / NATO)", "#f59e0b"),
+        }[pa["cat"]]
+        return {"category": pa["cat"], "badge": pa["cat"], "label": meta[0], "color": meta[1],
+                "reg": reg, "type": t, "desc": desc, "ownOp": own_op,
+                "match_reason": "plane-alert-db"}
 
     # 1. NPAS (National Police Air Service)
     npas_reason = None
@@ -278,6 +330,9 @@ def compute_benchmark_stats() -> Dict[str, Any]:
         "signal_dbfs": 0.0,
         "noise_dbfs": 0.0,
         "gain_db": 0.0,
+        "strong_pct": 0.0,
+        "peak_dbfs": 0.0,
+        "gain_hint": "",
         "total_tracks": 0,
         "uptime_min": 0.0,
         "sectors": [],
@@ -298,6 +353,16 @@ def compute_benchmark_stats() -> Dict[str, Any]:
         bench["max_range_km"] = round(md_m / 1000.0, 1)
         bench["max_range_nm"] = round(md_m / 1852.0, 1)
         bench["total_tracks"] = tot.get("tracks", {}).get("all", 0)
+
+        l1loc = l1.get("local", {})
+        acc1 = l1loc.get("accepted", [0, 0])
+        good = max(1, (acc1[0] if acc1 else 0) + (acc1[1] if len(acc1) > 1 else 0))
+        bench["strong_pct"] = round(100.0 * l1loc.get("strong_signals", 0) / good, 2)
+        bench["peak_dbfs"] = l1loc.get("peak_signal", 0.0)
+        bench["est_ppm"] = st.get("estimated_ppm")
+        # >3% strong signals suggests front-end overload (gain too high); <0.5% suggests headroom
+        sp = bench["strong_pct"]
+        bench["gain_hint"] = "OVERLOAD: lower gain" if sp > 3.0 else ("headroom: could raise gain" if sp < 0.5 else "optimal")
 
         loc = tot.get("local", {})
         sig = loc.get("signal", -12.0)
