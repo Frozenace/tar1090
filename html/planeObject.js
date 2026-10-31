@@ -2811,26 +2811,26 @@ PlaneObject.prototype.checkVisible = function() {
 PlaneObject.prototype.setTypeData = function() {
 	if (g.type_cache == null || !this.icaoType || this.icaoType == this.icaoTypeCache)
         return;
-    this.updateMarker();
     this.icaoTypeCache = this.icaoType;
 
     let typeCode = this.icaoType.toUpperCase();
     if (typeCode == 'P8 ?') {
         typeCode = 'P8';
     }
-    if (!(typeCode in g.type_cache))
-        return;
-
-    let typeData = g.type_cache[typeCode];
-    const typeLong = typeData[0];
-    const desc = typeData[1];
-    const wtc = typeData[2];
-    if (desc != null)
-        this.typeDescription = `${desc}`;
-    if (wtc != null)
-        this.wtc = `${wtc}`;
-    if (this.typeLong == null && typeLong != null)
-        this.typeLong = `${typeLong}`;
+    if (typeCode in g.type_cache) {
+        let typeData = g.type_cache[typeCode];
+        const typeLong = typeData[0];
+        const desc = typeData[1];
+        const wtc = typeData[2];
+        if (desc != null)
+            this.typeDescription = `${desc}`;
+        if (wtc != null)
+            this.wtc = `${wtc}`;
+        if (this.typeLong == null && typeLong != null)
+            this.typeLong = `${typeLong}`;
+    }
+    this.baseMarkerKey = null;
+    this.updateMarker();
 };
 
 PlaneObject.prototype.setTypeFlagsReg = function(data) {
