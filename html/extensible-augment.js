@@ -12,6 +12,8 @@
         augmentEnabled: true,
         deadReckoningEnabled: true,
         radarScopeEnabled: true,
+        airportsOverlay: true,
+        airportsPanelOpen: true,
         polarOpen: false,
         hudCollapsed: false,
         splitCompare: false,
@@ -367,6 +369,141 @@
         requestAnimationFrame(animateRadarLoop);
     }
 
+    // Airport overlay: runway axis, ICAO + wind/visibility label coloured by flight category
+    const FLT_CAT_COLORS = { VFR: "#22c55e", MVFR: "#3b82f6", IFR: "#ef4444", LIFR: "#d946ef" };
+
+    function fmtWind(m) {
+        if (!m) return "no METAR";
+        if (m.wspd === 0 || m.wspd == null) return "calm";
+        const dir = (typeof m.wdir === "number") ? String(Math.round(m.wdir)).padStart(3, "0") : "VRB";
+        return `${dir}°/${m.wspd}${m.wgst ? "G" + m.wgst : ""}kt`;
+    }
+
+    function fmtVis(m) {
+        if (!m || m.vis_sm == null) return "--";
+        const v = Number(m.vis_sm);
+        if (isNaN(v)) return String(m.vis_sm);
+        return v >= 6.2 ? "10km+" : (v * 1.609).toFixed(v < 1 ? 1 : 0) + "km";
+    }
+
+    function drawAirportMarkers(ctx, dpr, w, h) {
+        const aug = TacticalEngine.latestAugment;
+        if (!TacticalEngine.airportsOverlay || !aug || !Array.isArray(aug.airports)) return;
+        const zoom = OLMap.getView().getZoom() || 9;
+        ctx.save();
+        ctx.textBaseline = "middle";
+        for (let i = 0; i < aug.airports.length; i++) {
+            const a = aug.airports[i];
+            const px = OLMap.getPixelFromCoordinate(ol.proj.fromLonLat([a.lon, a.lat]));
+            if (!px) continue;
+            const x = px[0] * dpr, y = px[1] * dpr;
+            if (x < -60 || y < -60 || x > w + 60 || y > h + 60) continue;
+            const m = a.metar;
+            const col = (m && FLT_CAT_COLORS[m.cat]) || "#94a3b8";
+
+            // runway axis, ~1.5 NM long at current zoom (min 8px so it stays visible zoomed out)
+            const res = OLMap.getView().getResolution() || 1;
+            const nmPx = 1852 / (res * Math.cos(a.lat * Math.PI / 180)); // CSS px per NM
+            const half = Math.max(8 * dpr, Math.min(60 * dpr, 0.75 * nmPx * dpr));
+            const rad = ((a.axis - 90) * Math.PI) / 180.0;
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 2.4 * dpr;
+            ctx.beginPath();
+            ctx.moveTo(x - half * Math.cos(rad), y - half * Math.sin(rad));
+            ctx.lineTo(x + half * Math.cos(rad), y + half * Math.sin(rad));
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(x, y, 3 * dpr, 0, Math.PI * 2);
+            ctx.fillStyle = col;
+            ctx.fill();
+
+            if (zoom < 7.5) continue;
+            const line1 = a.icao + (a.active_rwy ? "  RWY " + a.active_rwy : "");
+            const line2 = m ? `${fmtWind(m)} · vis ${fmtVis(m)} · ${m.clouds}` : "no METAR";
+            ctx.font = `700 ${Math.round(10.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
+            const w1 = ctx.measureText(line1).width;
+            ctx.font = `600 ${Math.round(9.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
+            const w2 = ctx.measureText(line2).width;
+            const bw = Math.max(w1, w2) + 10 * dpr, bh = 29 * dpr;
+            const bx = x + 10 * dpr, by = y - bh / 2;
+            ctx.fillStyle = "rgba(11,17,32,0.82)";
+            ctx.fillRect(bx, by, bw, bh);
+            ctx.fillStyle = col;
+            ctx.fillRect(bx, by, 3 * dpr, bh);
+            ctx.font = `700 ${Math.round(10.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
+            ctx.fillStyle = "#f8fafc";
+            ctx.textAlign = "left";
+            ctx.fillText(line1, bx + 7 * dpr, by + 9 * dpr);
+            ctx.font = `600 ${Math.round(9.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
+            ctx.fillStyle = "#cbd5e1";
+            ctx.fillText(line2, bx + 7 * dpr, by + 21 * dpr);
+        }
+        ctx.restore();
+    }
+
+    function renderAirportsPanel() {
+        let el = document.getElementById("tar1090-airports-panel");
+        const aug = TacticalEngine.latestAugment;
+        if (!aug || !Array.isArray(aug.airports)) return;
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "tar1090-airports-panel";
+            document.body.appendChild(el);
+        }
+        if (!TacticalEngine.airportsPanelOpen) {
+            el.innerHTML = `<button class="thud-btn" id="apt-expand">✈ Airports ▴</button>`;
+            document.getElementById("apt-expand").onclick = function () {
+                TacticalEngine.airportsPanelOpen = true;
+                renderAirportsPanel();
+            };
+            return;
+        }
+        let rows = "";
+        for (let i = 0; i < aug.airports.length; i++) {
+            const a = aug.airports[i];
+            const m = a.metar;
+            const col = (m && FLT_CAT_COLORS[m.cat]) || "#64748b";
+            const counts = `<span title="inbound">▼${a.inbound.length}</span> <span title="departing">▲${a.departing.length}</span> <span title="local / circuit">⟳${a.local.length}</span> <span title="on ground">⏚${a.ground.length}</span>`;
+            const tip = m ? m.raw.replace(/"/g, "&quot;") : "No METAR available";
+            rows += `<div class="apt-row" data-lat="${a.lat}" data-lon="${a.lon}" title="${tip}">
+                <span class="apt-dot" style="background:${col}"></span>
+                <b class="apt-icao">${a.icao}</b>
+                <span class="apt-name">${a.name}</span>
+                <span class="apt-wx">${m ? m.cat : "--"} · ${fmtWind(m)} · ${fmtVis(m)} · ${m ? m.clouds : ""} · Q${m && m.qnh ? Math.round(m.qnh) : "--"}</span>
+                <span class="apt-rwy">${a.active_rwy ? "RWY " + a.active_rwy : a.rwy_pair}</span>
+                <span class="apt-cnt">${counts}</span>
+                <span class="apt-dist">${a.dist_nm}NM</span>
+            </div>`;
+        }
+        el.innerHTML = `
+            <div class="apt-head">
+                <b>✈ Nearby Airports</b>
+                <span>
+                    <button class="thud-btn ${TacticalEngine.airportsOverlay ? "active" : ""}" id="apt-overlay">Map: ${TacticalEngine.airportsOverlay ? "ON" : "OFF"}</button>
+                    <button class="thud-btn" id="apt-collapse">▾</button>
+                </span>
+            </div>
+            <div class="apt-body">${rows}</div>`;
+        document.getElementById("apt-collapse").onclick = function () {
+            TacticalEngine.airportsPanelOpen = false;
+            renderAirportsPanel();
+        };
+        document.getElementById("apt-overlay").onclick = function () {
+            TacticalEngine.airportsOverlay = !TacticalEngine.airportsOverlay;
+            renderAirportsPanel();
+        };
+        const rowEls = el.querySelectorAll(".apt-row");
+        for (let i = 0; i < rowEls.length; i++) {
+            rowEls[i].onclick = function () {
+                OLMap.getView().animate({
+                    center: ol.proj.fromLonLat([Number(this.getAttribute("data-lon")), Number(this.getAttribute("data-lat"))]),
+                    zoom: Math.max(OLMap.getView().getZoom() || 9, 11),
+                    duration: 400
+                });
+            };
+        }
+    }
+
     function drawRadarScope(resizeFn) {
         if (!radarCanvas || !radarCtx || typeof OLMap === "undefined" || typeof ol === "undefined") return;
         resizeFn();
@@ -375,6 +512,8 @@
         const h = radarCanvas.height;
         const ctx = radarCtx;
         ctx.clearRect(0, 0, w, h);
+
+        drawAirportMarkers(ctx, dpr, w, h);
 
         if (!TacticalEngine.radarScopeEnabled) return;
 
@@ -980,6 +1119,45 @@
                 font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
             }
 
+            /* Airports panel */
+            #tar1090-airports-panel {
+                position: fixed;
+                left: 270px;
+                bottom: 34px;
+                z-index: 940;
+                width: min(640px, calc(100vw - 560px));
+                min-width: 360px;
+                background: rgba(11, 17, 32, 0.92);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(56, 189, 248, 0.35);
+                border-radius: 10px;
+                box-shadow: 0 6px 22px rgba(0, 0, 0, 0.65);
+                color: #f1f5f9;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-size: 10.5px;
+                padding: 5px 7px;
+            }
+            .apt-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+            .apt-body { max-height: 190px; overflow-y: auto; }
+            .apt-row {
+                display: grid;
+                grid-template-columns: 10px 38px 1fr auto 52px auto 44px;
+                gap: 6px;
+                align-items: center;
+                padding: 2px 3px;
+                border-radius: 4px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .apt-row:hover { background: rgba(51, 65, 85, 0.7); }
+            .apt-dot { width: 8px; height: 8px; border-radius: 50%; }
+            .apt-icao { font-family: ui-monospace, Menlo, Consolas, monospace; color: #38bdf8; }
+            .apt-name { overflow: hidden; text-overflow: ellipsis; color: #cbd5e1; }
+            .apt-wx { font-family: ui-monospace, Menlo, Consolas, monospace; color: #e2e8f0; }
+            .apt-rwy { color: #fbbf24; font-weight: 700; }
+            .apt-cnt { color: #94a3b8; font-family: ui-monospace, Menlo, Consolas, monospace; }
+            .apt-dist { color: #64748b; text-align: right; }
+
             /* Top Tactical HUD */
             #tar1090-tactical-hud {
                 position: fixed;
@@ -1418,6 +1596,7 @@
                 }
                 updateLeftAircraftPanelBadge();
                 renderHud();
+                renderAirportsPanel();
             })
             .catch(function () {});
     }

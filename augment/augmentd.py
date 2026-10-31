@@ -20,6 +20,8 @@ import time
 import urllib.request
 from typing import Dict, List, Any, Optional, Tuple
 
+import airports as airports_mod
+
 # Force IPv4 resolution so urllib doesn't hang on dead IPv6 routes
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -590,11 +592,24 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
 
     findings_summary = update_findings_log(local_ac_list, cached_open, classifications)
 
+    # Nearby-airport weather + traffic buckets (local RF wins over open-feed duplicates)
+    combined: Dict[str, Dict[str, Any]] = {h: a for h, a in cached_open.items()}
+    for h, a in local_by_hex.items():
+        merged_ac = dict(combined.get(h, {}))
+        merged_ac.update({k: v for k, v in a.items() if v is not None})
+        combined[h] = merged_ac
+    try:
+        airport_status = airports_mod.build_status(SITE_LAT, SITE_LON, list(combined.values()))
+    except Exception as exc:
+        print(f"[augmentd] airports error: {exc}", flush=True)
+        airport_status = []
+
     payload = {
         "now": now_ts,
         "uat_978": "true",
         "benchmark": bench,
         "findings_summary": findings_summary,
+        "airports": airport_status,
         "tactical_active": tactical_list,
         "classifications": classifications,
         "aircraft": augmented_aircraft,
