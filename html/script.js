@@ -6222,7 +6222,7 @@ function processURLParams(){
 
     if (urlIcaos.length > 0) {
         const icaos = urlIcaos;
-        if (!usp.has('noIsolation') && !usp.has('replay'))
+        if (usp.has('isolate') && !usp.has('replay'))
             toggleIsolation("on");
         if (icaos.length > 1) {
             toggleMultiSelect("on");
