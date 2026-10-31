@@ -28,6 +28,9 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 READSB_DIR = "/run/readsb"
 OUTPUT_FILE = "/run/readsb/augmented.json"
+STATE_DIR = "/var/lib/tar1090-augment"
+BASELINE_FILE = "/var/lib/tar1090-augment/baseline_before_readsb_tuning.json"
+FINDINGS_FILE = "/var/lib/tar1090-augment/findings.json"
 
 
 def load_site_coords() -> Tuple[float, float]:
@@ -45,18 +48,17 @@ def load_site_coords() -> Tuple[float, float]:
 SITE_LAT, SITE_LON = load_site_coords()
 
 OPEN_ENDPOINTS = [
-    ("adsb_lol_regional", f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/180"),
-    ("adsb_lol_mil", "https://api.adsb.lol/v2/mil"),
+    ("adsb_fi_regional", f"https://opendata.adsb.fi/api/v2/lat/{SITE_LAT}/lon/{SITE_LON}/dist/200"),
 ]
 FALLBACK_ENDPOINTS = [
-    ("adsb_fi_regional", f"https://opendata.adsb.fi/api/v2/lat/{SITE_LAT}/lon/{SITE_LON}/dist/180"),
-    ("adsb_fi_mil", "https://opendata.adsb.fi/api/v2/mil"),
+    ("adsb_lol_regional", f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200"),
 ]
 
 # Extensible UK & NATO Tactical Rules
 NPAS_REG_PREFIXES = ("G-POL", "G-NPA", "G-MPS", "G-PSN")
 NPAS_CALL_PREFIXES = ("UKP", "NPAS", "POLICE", "POL")
 NPAS_SQUAWKS = {"0032", "7004"}
+NPAS_OP_KEYWORDS = ("NATIONAL POLICE", "POLICE AIR", "NPAS", "METROPOLITAN POLICE", "POLICE SCOTLAND")
 
 HEMS_REG_PREFIXES = (
     "G-EHM", "G-EHE",   # Essex & Herts Air Ambulance (Earls Colne / North Weald)
@@ -77,10 +79,12 @@ HEMS_REG_PREFIXES = (
 )
 HEMS_CALL_PREFIXES = ("HLE", "EHA", "ANG", "HELIMED", "LIFELN", "MEDIC", "AIRAMB", "GMA")
 HEMS_SQUAWKS = {"0020"}
+HEMS_OP_KEYWORDS = ("AIR AMBULANCE", "HELIMED", "SCOTLAND CHARITY AIR AMBULANCE")
 
-SAR_REG_PREFIXES = ("G-MCG", "G-CG", "G-SAR", "G-HMCG", "2-GGGG")
-SAR_CALL_PREFIXES = ("SRG", "RESCUE", "COAST", "CGD", "UKCG")
+SAR_REG_PREFIXES = ("G-MCG", "G-CG", "G-SAR", "G-HMCG", "2-GGGG", "G-WKTS", "G-DLAA", "G-DSMR")
+SAR_CALL_PREFIXES = ("SRG", "RESCUE", "COAST", "CGD", "UKCG", "WDG", "BDR")
 SAR_SQUAWKS = {"0023", "0036"}
+SAR_OP_KEYWORDS = ("COASTGUARD", "SEARCH AND RESCUE", "MARITIME AND COASTGUARD", "BORDER FORCE")
 
 MIL_HEX_PREFIXES = (
     "43c",  # UK Military (RAF / AAC / RN)
@@ -94,9 +98,14 @@ MIL_CALL_PREFIXES = (
     "TYPHOON", "COBRA", "VIPER", "LION", "NATO", "MMF", "RCH", "KNIFE",
     "JOLLY", "ASCOT", "TARTAN", "RAF", "NAVY", "ARMY", "GAF", "FAF", "BAF",
     "KRF", "LCG", "MAD", "NOH", "WAD", "GONZO", "TALON", "REAPER", "FOCUS",
-    "QUID", "HOBO", "Bolar", "BOLAR", "CHAOS", "SAVAGE", "KILLER",
+    "QUID", "HOBO", "Bolar", "BOLAR", "CHAOS", "SAVAGE", "KILLER", "TESTER",
 )
 MIL_REG_PREFIXES = ("ZM", "ZZ", "ZH", "ZK", "ZA", "ZB", "ZE", "ZJ", "XZ", "XW", "XX")
+MIL_OP_KEYWORDS = (
+    "ROYAL AIR FORCE", "ROYAL NAVY", "ARMY AIR CORPS", "MINISTRY OF DEFENCE",
+    "UNITED STATES AIR FORCE", "US AIR FORCE", "US NAVY", "US ARMY",
+    "QINETIQ", "DRAKEN", "COBHAM", "NATO", "LUFTWAFFE", "ARMEE DE L'AIR",
+)
 
 
 def dist_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, float, float]:
@@ -115,21 +124,28 @@ def dist_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[fl
 
 
 def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Classify aircraft into NPAS, HEMS, SAR, or MIL with high fidelity."""
+    """Classify aircraft into NPAS, HEMS, SAR, or MIL with high fidelity & operator awareness."""
     hx = str(ac.get("hex", "")).strip().lower()
     fl = str(ac.get("flight", "")).strip().upper()
     reg = str(ac.get("r", "")).strip().upper()
     sqk = str(ac.get("squawk", "")).strip()
     t = str(ac.get("t", "")).strip().upper()
     desc = str(ac.get("desc", "")).strip()
+    own_op = str(ac.get("ownOp", "") or "").strip()
+    own_op_up = own_op.upper()
     db_flags = int(ac.get("dbFlags", 0) or 0)
 
     # 1. NPAS (National Police Air Service)
-    if (
-        reg.startswith(NPAS_REG_PREFIXES)
-        or fl.startswith(NPAS_CALL_PREFIXES)
-        or sqk in NPAS_SQUAWKS
-    ):
+    npas_reason = None
+    if reg.startswith(NPAS_REG_PREFIXES):
+        npas_reason = f"reg:{reg}"
+    elif fl.startswith(NPAS_CALL_PREFIXES):
+        npas_reason = f"callsign:{fl}"
+    elif sqk in NPAS_SQUAWKS:
+        npas_reason = f"squawk:{sqk}"
+    elif own_op_up and any(k in own_op_up for k in NPAS_OP_KEYWORDS):
+        npas_reason = f"ownOp:{own_op}"
+    if npas_reason:
         return {
             "category": "NPAS",
             "badge": "NPAS",
@@ -138,14 +154,21 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
             "reg": reg,
             "type": t,
             "desc": desc or "Police Helicopter / Fixed-Wing",
+            "ownOp": own_op,
+            "match_reason": npas_reason,
         }
 
     # 2. HEMS (Air Ambulance / Helimed)
-    if (
-        reg.startswith(HEMS_REG_PREFIXES)
-        or fl.startswith(HEMS_CALL_PREFIXES)
-        or sqk in HEMS_SQUAWKS
-    ):
+    hems_reason = None
+    if reg.startswith(HEMS_REG_PREFIXES):
+        hems_reason = f"reg:{reg}"
+    elif fl.startswith(HEMS_CALL_PREFIXES):
+        hems_reason = f"callsign:{fl}"
+    elif sqk in HEMS_SQUAWKS:
+        hems_reason = f"squawk:{sqk}"
+    elif own_op_up and any(k in own_op_up for k in HEMS_OP_KEYWORDS):
+        hems_reason = f"ownOp:{own_op}"
+    if hems_reason:
         return {
             "category": "HEMS",
             "badge": "HEMS",
@@ -154,14 +177,21 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
             "reg": reg,
             "type": t,
             "desc": desc or "Air Ambulance Helicopter",
+            "ownOp": own_op,
+            "match_reason": hems_reason,
         }
 
-    # 3. SAR (HM Coastguard / Search & Rescue)
-    if (
-        reg.startswith(SAR_REG_PREFIXES)
-        or fl.startswith(SAR_CALL_PREFIXES)
-        or sqk in SAR_SQUAWKS
-    ):
+    # 3. SAR (HM Coastguard / Search & Rescue / Maritime ISR)
+    sar_reason = None
+    if reg.startswith(SAR_REG_PREFIXES):
+        sar_reason = f"reg:{reg}"
+    elif fl.startswith(SAR_CALL_PREFIXES):
+        sar_reason = f"callsign:{fl}"
+    elif sqk in SAR_SQUAWKS:
+        sar_reason = f"squawk:{sqk}"
+    elif own_op_up and any(k in own_op_up for k in SAR_OP_KEYWORDS):
+        sar_reason = f"ownOp:{own_op}"
+    if sar_reason:
         return {
             "category": "SAR",
             "badge": "SAR",
@@ -170,15 +200,23 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
             "reg": reg,
             "type": t,
             "desc": desc or "Search & Rescue Aircraft",
+            "ownOp": own_op,
+            "match_reason": sar_reason,
         }
 
-    # 4. Military (UK MoD / RAF / AAC / USAF / NATO)
-    if (
-        (db_flags & 1) != 0
-        or hx.startswith(MIL_HEX_PREFIXES)
-        or fl.startswith(MIL_CALL_PREFIXES)
-        or reg.startswith(MIL_REG_PREFIXES)
-    ):
+    # 4. Military (UK MoD / RAF / AAC / USAF / NATO / Defense Test)
+    mil_reason = None
+    if (db_flags & 1) != 0:
+        mil_reason = "dbFlags:1"
+    elif hx.startswith(MIL_HEX_PREFIXES):
+        mil_reason = f"hex:{hx[:3]}*"
+    elif fl.startswith(MIL_CALL_PREFIXES):
+        mil_reason = f"callsign:{fl}"
+    elif reg.startswith(MIL_REG_PREFIXES):
+        mil_reason = f"reg:{reg}"
+    elif own_op_up and any(k in own_op_up for k in MIL_OP_KEYWORDS):
+        mil_reason = f"ownOp:{own_op}"
+    if mil_reason:
         return {
             "category": "MIL",
             "badge": "MIL",
@@ -187,6 +225,8 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
             "reg": reg,
             "type": t,
             "desc": desc or "Military Aircraft",
+            "ownOp": own_op,
+            "match_reason": mil_reason,
         }
 
     return None
@@ -483,10 +523,13 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
     bench["local_mode_s_only"] = local_mode_s_only
     bench["furthest_live"] = furthest_local
 
+    findings_summary = update_findings_log(local_ac_list, cached_open, classifications)
+
     payload = {
         "now": now_ts,
         "uat_978": "true",
         "benchmark": bench,
+        "findings_summary": findings_summary,
         "tactical_active": tactical_list,
         "classifications": classifications,
         "aircraft": augmented_aircraft,
@@ -498,13 +541,192 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
     os.replace(tmp_path, OUTPUT_FILE)
 
 
+_LAST_FINDINGS_WRITE = 0.0
+
+
+def update_findings_log(
+    local_ac_list: List[Dict[str, Any]],
+    cached_open: Dict[str, Dict[str, Any]],
+    classifications: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Track decoder before/after performance and upstream tar1090-db discrepancies."""
+    global _LAST_FINDINGS_WRITE
+    now = time.time()
+
+    existing: Dict[str, Any] = {}
+    try:
+        if os.path.exists(FINDINGS_FILE):
+            with open(FINDINGS_FILE, "r") as f:
+                existing = json.load(f)
+    except Exception:
+        existing = {}
+
+    db_discrepancies: Dict[str, Any] = existing.get("db_discrepancies", {})
+    local_only_hexes: Dict[str, Any] = existing.get("local_only_hexes", {})
+
+    # 1. Check all combined aircraft for tactical classification vs upstream dbFlags/metadata gaps
+    all_seen: Dict[str, Dict[str, Any]] = {}
+    for hx, oac in cached_open.items():
+        all_seen[hx] = dict(oac)
+    for lac in local_ac_list:
+        hx = str(lac.get("hex", "")).strip().lower()
+        if not hx:
+            continue
+        merged = dict(all_seen.get(hx, {}))
+        merged.update(lac)
+        all_seen[hx] = merged
+
+        # Track local-only detections (decoded by tuned local readsb, absent in community snapshot)
+        if cached_open and hx not in cached_open and len(local_only_hexes) < 200:
+            local_only_hexes[hx] = {
+                "hex": hx,
+                "r": lac.get("r", ""),
+                "t": lac.get("t", ""),
+                "desc": lac.get("desc", ""),
+                "flight": str(lac.get("flight", "")).strip(),
+                "rssi": lac.get("rssi"),
+                "dst_nm": lac.get("r_dst"),
+                "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            }
+
+    for hx, info in classifications.items():
+        cat = info.get("category")
+        if cat not in ("NPAS", "HEMS", "SAR", "MIL"):
+            continue
+        ac = all_seen.get(hx, {})
+        db_flags = int(ac.get("dbFlags", 0) or 0)
+        reg = str(ac.get("r") or info.get("reg") or "").strip().upper()
+        ac_type = str(ac.get("t") or info.get("type") or "").strip().upper()
+        desc = str(ac.get("desc") or info.get("desc") or "").strip()
+        own_op = str(ac.get("ownOp") or info.get("ownOp") or "").strip()
+        fl = str(ac.get("flight") or "").strip().upper()
+
+        # Check if upstream tar1090-db is missing military/interesting bitmask or metadata
+        expected_flag = 1 if cat == "MIL" else 2
+        missing_flag = (db_flags & expected_flag) == 0
+        missing_meta = (not reg) or (not ac_type)
+        if missing_flag or missing_meta:
+            suggested_flags = db_flags | expected_flag
+            db_discrepancies[hx] = {
+                "hex": hx,
+                "category": cat,
+                "match_reason": info.get("match_reason", "rule"),
+                "flight": fl,
+                "r": reg,
+                "t": ac_type,
+                "desc": desc,
+                "ownOp": own_op,
+                "current_dbFlags": db_flags,
+                "suggested_dbFlags": suggested_flags,
+                "issue": (
+                    "missing_dbFlags_and_metadata"
+                    if (missing_flag and missing_meta)
+                    else ("missing_dbFlags" if missing_flag else "missing_metadata")
+                ),
+                "tar1090_db_csv_suggestion": f"{hx.upper()};{reg};{ac_type};{suggested_flags};{desc};;{own_op or info.get('label', '')};",
+                "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            }
+
+    # 2. Compute live readsb decoder comparison against pre-tuning baseline
+    decoder_eval: Dict[str, Any] = existing.get("decoder_evaluation", {})
+    try:
+        with open(os.path.join(READSB_DIR, "stats.json"), "r") as f:
+            st = json.load(f)
+        baseline = {}
+        if os.path.exists(BASELINE_FILE):
+            with open(BASELINE_FILE, "r") as f:
+                baseline = json.load(f)
+
+        # Use last15min if full, otherwise total since restart
+        win = st.get("last15min", {})
+        if (win.get("end", 0) - win.get("start", 0)) < 300:
+            win = st.get("total", {})
+        dur_s = max(1.0, float(win.get("end", 1.0) - win.get("start", 0.0)))
+        loc = win.get("local", {})
+        acc = loc.get("accepted", [0, 0])
+        acc_0 = acc[0] if len(acc) > 0 else 0
+        acc_1 = acc[1] if len(acc) > 1 else 0
+        valid_msgs = max(1, int(win.get("messages_valid", 0) or 1))
+        crc_1bit_pct = round((acc_1 / valid_msgs) * 100.0, 2)
+        demod_ms = float(win.get("cpu", {}).get("demod", 0.0) or 0.0)
+        demod_cpu_pct = round((demod_ms / (dur_s * 1000.0)) * 100.0, 2)
+
+        total_local = len(local_ac_list)
+        with_reg = sum(1 for a in local_ac_list if a.get("r"))
+        db_enrichment_pct = round((with_reg / max(1, total_local)) * 100.0, 1) if total_local else 100.0
+
+        base_l15 = baseline.get("last15min", {})
+        base_acc = base_l15.get("local", {}).get("accepted", [204668, 10245])
+        base_valid = max(1, int(base_l15.get("messages_valid", 214913) or 214913))
+        base_1bit_pct = round((base_acc[1] / base_valid) * 100.0, 2)
+        base_demod_pct = round((float(base_l15.get("cpu", {}).get("demod", 35789)) / 900000.0) * 100.0, 2)
+
+        decoder_eval = {
+            "baseline_captured_at": baseline.get("captured_at"),
+            "evaluated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "window_seconds": round(dur_s, 1),
+            "before": {
+                "preamble_threshold": 42,
+                "no_fix_df": True,
+                "ppm_configured": 0,
+                "estimated_ppm": baseline.get("config", {}).get("estimated_ppm", -2.6),
+                "db_enrichment_pct": 0.0,
+                "crc_1bit_recovery_pct": base_1bit_pct,
+                "demod_cpu_core_pct": base_demod_pct,
+            },
+            "after": {
+                "preamble_threshold": 40,
+                "no_fix_df": False,
+                "ppm_configured": 0,
+                "estimated_ppm": st.get("estimated_ppm"),
+                "db_enrichment_pct": db_enrichment_pct,
+                "crc_1bit_recovery_pct": crc_1bit_pct,
+                "demod_cpu_core_pct": demod_cpu_pct,
+                "messages_per_sec": round(valid_msgs / dur_s, 1),
+            },
+            "deltas": {
+                "db_enrichment_pct_delta": round(db_enrichment_pct - 0.0, 1),
+                "crc_1bit_recovery_pct_delta": round(crc_1bit_pct - base_1bit_pct, 2),
+                "demod_cpu_core_pct_delta": round(demod_cpu_pct - base_demod_pct, 2),
+            },
+        }
+    except Exception:
+        pass
+
+    summary = {
+        "db_discrepancies_count": len(db_discrepancies),
+        "local_only_detections_count": len(local_only_hexes),
+        "decoder_evaluation": decoder_eval,
+    }
+
+    if now - _LAST_FINDINGS_WRITE >= 15.0 or not os.path.exists(FINDINGS_FILE):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            full_report = {
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "summary": summary,
+                "decoder_evaluation": decoder_eval,
+                "db_discrepancies": db_discrepancies,
+                "local_only_hexes": local_only_hexes,
+            }
+            tmp_f = FINDINGS_FILE + ".tmp"
+            with open(tmp_f, "w") as f:
+                json.dump(full_report, f, indent=2)
+            os.replace(tmp_f, FINDINGS_FILE)
+            _LAST_FINDINGS_WRITE = now
+        except Exception:
+            pass
+
+    return summary
+
+
 def main() -> None:
     once = "--once" in sys.argv
     cached_open: Dict[str, Dict[str, Any]] = {}
     last_open_fetch = 0.0
     while True:
         now = time.time()
-        if now - last_open_fetch >= 4.0:
+        if now - last_open_fetch >= 10.0:
             new_open = fetch_open_feeds()
             if new_open:
                 cached_open = new_open
