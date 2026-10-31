@@ -21,7 +21,7 @@ elif [[ -d "$HTML_PATH/db-$DB_VERSION" ]]; then
 fi
 
 # Carto basemap key lives outside the repo (never committed): /etc/tar1090-carto.key
-if [[ -r /etc/tar1090-carto.key ]]; then
+if sudo test -r /etc/tar1090-carto.key; then
     printf '\ncarto_api_key = "%s";\n' "$(sudo cat /etc/tar1090-carto.key)" | sudo tee -a "$TMP/config.js" >/dev/null
 fi
 
