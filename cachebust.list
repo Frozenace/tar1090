@@ -8,5 +8,6 @@ layers.js
 markers.js
 planeObject.js
 script.js
+extensible-augment.js
 registrations.js
 style.css

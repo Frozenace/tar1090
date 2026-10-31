@@ -332,47 +332,68 @@ function createBaseLayers() {
         type: 'base',
     }));
 
-    if (carto_api_key) {
+    if (true) {
 
-        const params = `?key=${carto_api_key}`;
+        const params = carto_api_key ? `?key=${carto_api_key}` : "";
 
         let basemap_id = "rastertiles/voyager";
         world.push(new ol.layer.Tile({
-            source: new ol.source.OSM({
-                "url" : "https://{a-d}.basemaps.cartocdn.com/"+ basemap_id + "/{z}/{x}/{y}.png" + params,
+            source: new ol.source.XYZ({
+                "url" : "https://{a-d}.basemaps.cartocdn.com/"+ basemap_id + "/{z}/{x}/{y}@2x.png" + params,
                 "attributions" : 'Powered by <a href="https://carto.com">CARTO.com</a>'
                 + ' using data by <a href="http://openstreetmap.org">OpenStreetMap</a>, under <a href="http://www.openstreetmap.org/copyright">ODbL</a>.',
                 attributionsCollapsible: false,
-                maxZoom: 15,
+                tilePixelRatio: 2,
+                maxZoom: 20,
                 transition: tileTransition,
             }),
             name: "carto_" + basemap_id,
-            title: 'CARTO.com English',
+            title: 'CARTO Voyager HD',
             type: 'base',
         }));
 
-        // carto.com basemaps, see the following URLs for details on them:
-        // http://basemaps.cartocdn.com
-        // https://github.com/CartoDB/cartodb/wiki/BaseMaps-available
-
-        let basemaps = [ "dark_all", "dark_nolabels",
-            "light_all", "light_nolabels"
-        ]
+        let basemaps = [
+            ["dark_all", "CARTO Dark HD"],
+            ["dark_nolabels", "CARTO Dark Clean HD"],
+            ["light_all", "CARTO Light HD"],
+            ["light_nolabels", "CARTO Light Clean HD"]
+        ];
 
         for (let i in basemaps) {
-            let basemap_id = basemaps[i];
+            let basemap_id = basemaps[i][0];
+            let basemap_title = basemaps[i][1];
 
             world.push(new ol.layer.Tile({
-                source: new ol.source.OSM({
-                    "url" : "https://{a-d}.basemaps.cartocdn.com/"+ basemap_id + "/{z}/{x}/{y}.png" + params,
+                source: new ol.source.XYZ({
+                    "url" : "https://{a-d}.basemaps.cartocdn.com/"+ basemap_id + "/{z}/{x}/{y}@2x.png" + params,
                     "attributions" : 'Powered by <a href="https://carto.com">CARTO.com</a>'
                     + ' using data by <a href="http://openstreetmap.org">OpenStreetMap</a>, under <a href="http://www.openstreetmap.org/copyright">ODbL</a>.',
                     attributionsCollapsible: false,
-                    maxZoom: 15,
+                    tilePixelRatio: 2,
+                    maxZoom: 20,
                     transition: tileTransition,
                 }),
                 name: "carto_" + basemap_id,
-                title: 'CARTO.com ' + basemap_id,
+                title: basemap_title,
+                type: 'base',
+            }));
+        }
+    }
+
+    if (Array.isArray(window.CustomMapProviders)) {
+        for (const p of window.CustomMapProviders) {
+            if (!p || !p.name || !p.url) continue;
+            world.push(new ol.layer.Tile({
+                source: new ol.source.XYZ({
+                    url: p.url,
+                    attributions: p.attributions || '',
+                    attributionsCollapsible: false,
+                    tilePixelRatio: p.tilePixelRatio || 1,
+                    maxZoom: p.maxZoom || 19,
+                    transition: tileTransition,
+                }),
+                name: p.name,
+                title: p.title || p.name,
                 type: 'base',
             }));
         }

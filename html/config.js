@@ -30,7 +30,7 @@
 // degrees.
 
 // The google maps zoom level, 0 - 16, lower is further out
-//DefaultZoomLvl   = 7;
+DefaultZoomLvl   = 9;
 
 // specify lat lon that the 'auto-select plane' feature will choose the closest plane to
 // autoselectCoords = [42, 21];
@@ -466,3 +466,96 @@ tableColors = {
 //
 
 // MergeNonIcao = false; // set to true to merge non icao hex with the icao hex (remove the ~)
+
+// --- Touchscreen, Extensible HD Maps & Tactical Customizations ---
+darkModeDefault = true;
+MapType_tar1090 = "carto_dark_all";
+MapDim = false;
+prefer978 = 8;
+
+// Extensible Map Provider Registry (add any XYZ/Retina tile source here)
+window.CustomMapProviders = [
+    {
+        name: "opentopo",
+        title: "OpenTopo Terrain Relief",
+        url: "https://{a-c}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        maxZoom: 17,
+        tilePixelRatio: 1
+    }
+];
+
+// Quick-switch Map Presets shown in the HUD bar
+window.HudMapPresets = [
+    { id: "carto_dark_all", label: "Dark HD", bg: "#0e131a" },
+    { id: "OpenFreeMapFiord", label: "Radar Vec", bg: "#1c2636" },
+    { id: "OpenFreeMapDark", label: "Dark Vec", bg: "#1a1a1a" },
+    { id: "carto_rastertiles/voyager", label: "Voyager HD", bg: "#f5f3f0" },
+    { id: "esri", label: "Satellite", bg: "#0b151e" },
+    { id: "opentopo", label: "Terrain", bg: "#e8e4d8" },
+    { id: "osm", label: "OSM (Old)", bg: "#aad3df" }
+];
+
+DefaultZoomLvl   = 9.2;
+
+// SiteLat & SiteLon are loaded automatically from /run/readsb/receiver.json
+SiteShow = true;
+SiteName = "Local ADS-B Receiver";
+SiteCircles = true;
+SiteCirclesDistances = [25, 50, 75, 100, 125];
+SiteCirclesColors = ['#3b82f6', '#2563eb', '#1d4ed8', '#06b6d4', '#f59e0b'];
+
+actual_range_show = true;
+actual_range_outline_color = '#06b6d4';
+actual_range_outline_width = 2.0;
+
+// High-visibility icons, trails, and labels for 800x480 touchscreen
+iconScale = 1.3;
+outlineWidth = 1.25;
+lineWidth = 2.2;
+defaultAllTracks = true;
+defaultLabels = true;
+defaultExtendedLabels = 0;
+labelScale = 1.15;
+headingLineMinutes = 2;
+useRouteAPI = true;
+
+// Compact table columns for 800x480 screen width
+HideCols = [
+    "#icao",
+    "#country",
+    "#registration",
+    "#airline",
+    "#squawk",
+    "#vert_rate",
+    "#sitedist",
+    "#track",
+    "#msgs",
+    "#seen",
+    "#rssi",
+    "#lat",
+    "#lon",
+    "#data_source",
+    "#military",
+    "#wd",
+    "#ws"
+];
+
+// Enable built-in Fullscreen / Desktop toggle button on touchscreen
+window.addEventListener('load', function() {
+    var fsBtn = document.getElementById('fullscreenButton');
+    if (fsBtn) {
+        fsBtn.style.display = 'inline-block';
+        fsBtn.title = 'Toggle Fullscreen / Desktop';
+        fsBtn.onclick = function() {
+            if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                fetch('http://127.0.0.1:8755/toggle').catch(function() {});
+            } else {
+                if (!document.fullscreenElement) {
+                    document.documentElement.requestFullscreen();
+                } else if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                }
+            }
+        };
+    }
+});
