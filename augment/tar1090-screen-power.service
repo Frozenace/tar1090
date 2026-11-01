@@ -1,0 +1,18 @@
+[Unit]
+Description=TAR1090 DSI Touchscreen Idle Dim & Power Save Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/admin/tar1090-project/augment
+ExecStart=/usr/bin/python3 -u /home/admin/tar1090-project/augment/screen_powerd.py
+Restart=always
+RestartSec=3
+Environment=IDLE_DIM_SEC=90
+Environment=IDLE_OFF_SEC=120
+Environment=DIM_BRIGHTNESS=25
+Environment=ACTIVE_BRIGHTNESS=255
+
+[Install]
+WantedBy=multi-user.target
