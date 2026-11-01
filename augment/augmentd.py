@@ -11,11 +11,14 @@ Combines:
 Outputs /run/readsb/augmented.json (served at /tar1090/data/augmented.json).
 """
 
+import concurrent.futures
+import gzip
 import json
 import math
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.request
 from typing import Dict, List, Any, Optional, Tuple
@@ -49,11 +52,12 @@ def load_site_coords() -> Tuple[float, float]:
 
 SITE_LAT, SITE_LON = load_site_coords()
 
-OPEN_ENDPOINTS = [
-    ("adsb_fi_regional", f"https://opendata.adsb.fi/api/v2/lat/{SITE_LAT}/lon/{SITE_LON}/dist/200"),
-]
-FALLBACK_ENDPOINTS = [
-    ("adsb_lol_regional", f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200"),
+# Parallel Multi-Feed Open ADS-B + MLAT + Dedicated Military Endpoints
+PARALLEL_ENDPOINTS = [
+    ("adsb.fi", f"https://opendata.adsb.fi/api/v2/lat/{SITE_LAT}/lon/{SITE_LON}/dist/200", False),
+    ("adsb.lol", f"https://api.adsb.lol/v2/point/{SITE_LAT}/lon/{SITE_LON}/200" if False else f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200", False),
+    ("adsb.lol-mil", "https://api.adsb.lol/v2/mil", True),
+    ("adsb.fi-mil", "https://opendata.adsb.fi/api/v2/mil", True),
 ]
 
 PLANE_ALERT_CSV = os.environ.get("PLANE_ALERT_CSV", "/usr/local/share/tar1090/plane-alert/plane-alert-db.csv")
@@ -286,42 +290,116 @@ def classify_aircraft(ac: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return None
 
 
+_open_feed_lock = threading.Lock()
+_cached_open_feeds: Dict[str, Dict[str, Any]] = {}
+_active_feed_sources: List[str] = []
+_open_fetch_running = False
+_last_open_fetch_ts = 0.0
+
+_outline_cache_mtime = 0.0
+_outline_cached_sectors: List[Dict[str, Any]] = []
+_outline_best_nm = 0.0
+_outline_best_brng = 0.0
+
+
+def _fetch_single_endpoint(entry: Tuple[str, str, bool]) -> Tuple[str, List[Dict[str, Any]], bool]:
+    name, url, is_mil = entry
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "tar1090-project-augment/1.0",
+                "Accept-Encoding": "gzip",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=3.8) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode("utf-8", errors="ignore"))
+            ac_list = data.get("ac") or data.get("aircraft") or []
+            return name, ac_list, is_mil
+    except Exception:
+        return name, [], is_mil
+
+
 def fetch_open_feeds() -> Dict[str, Dict[str, Any]]:
-    """Fetch open ADS-B & MLAT feeds and index by lowercase hex."""
+    """Fetch open ADS-B, MLAT & Military feeds in parallel with gzip and fuse by lowercase hex."""
+    global _active_feed_sources
     merged: Dict[str, Dict[str, Any]] = {}
-    success = False
+    sources_ok: List[str] = []
 
-    for endpoint_group in (OPEN_ENDPOINTS, FALLBACK_ENDPOINTS):
-        if success:
-            break
-        for name, url in endpoint_group:
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "tar1090-project-augment/1.0"})
-                with urllib.request.urlopen(req, timeout=3.5) as resp:
-                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                    ac_list = data.get("ac") or data.get("aircraft") or []
-                    for ac in ac_list:
-                        hx = str(ac.get("hex", "")).strip().lower()
-                        if not hx:
-                            continue
-                        lat = ac.get("lat")
-                        lon = ac.get("lon")
-                        if lat is not None and lon is not None:
-                            _, d_nm, brng = dist_bearing(SITE_LAT, SITE_LON, float(lat), float(lon))
-                            if d_nm > 260.0:
-                                continue
-                            ac["r_dst"] = round(d_nm, 2)
-                            ac["r_dir"] = round(brng, 1)
-                        merged[hx] = ac
-                    success = True
-            except Exception:
-                pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_fetch_single_endpoint, PARALLEL_ENDPOINTS))
 
+    for name, ac_list, is_mil in results:
+        if not ac_list:
+            continue
+        sources_ok.append(name)
+        for ac in ac_list:
+            hx = str(ac.get("hex", "")).strip().lower()
+            if not hx:
+                continue
+            lat = ac.get("lat")
+            lon = ac.get("lon")
+            if lat is not None and lon is not None:
+                _, d_nm, brng = dist_bearing(SITE_LAT, SITE_LON, float(lat), float(lon))
+                if d_nm > 260.0:
+                    continue
+                ac["r_dst"] = round(d_nm, 2)
+                ac["r_dir"] = round(brng, 1)
+            elif is_mil:
+                # Skip global military contacts that have no position
+                continue
+
+            if is_mil:
+                ac["dbFlags"] = int(ac.get("dbFlags", 0) or 0) | 1
+
+            prev = merged.get(hx)
+            if not prev:
+                merged[hx] = ac
+            else:
+                # Fuse metadata from both feeds and keep fresher position
+                prev_seen = float(prev.get("seen_pos", 999.0) or 999.0)
+                new_seen = float(ac.get("seen_pos", 999.0) or 999.0)
+                base = dict(prev) if prev_seen <= new_seen else dict(ac)
+                other = ac if prev_seen <= new_seen else prev
+                for k in ("r", "t", "desc", "ownOp", "flight", "squawk"):
+                    if not base.get(k) and other.get(k):
+                        base[k] = other[k]
+                base["dbFlags"] = int(base.get("dbFlags", 0) or 0) | int(other.get("dbFlags", 0) or 0)
+                merged[hx] = base
+
+    if sources_ok:
+        _active_feed_sources = sources_ok
     return merged
 
 
+def refresh_open_feeds_async() -> None:
+    """Refresh fused open feeds in a background thread so the 2s loop never blocks."""
+    global _open_fetch_running, _last_open_fetch_ts, _cached_open_feeds
+    now = time.time()
+    if _open_fetch_running or (now - _last_open_fetch_ts) < 10.0:
+        return
+    _open_fetch_running = True
+    _last_open_fetch_ts = now
+
+    def _worker() -> None:
+        global _open_fetch_running, _cached_open_feeds
+        try:
+            new_open = fetch_open_feeds()
+            if new_open:
+                with _open_feed_lock:
+                    _cached_open_feeds = new_open
+        finally:
+            _open_fetch_running = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def compute_benchmark_stats() -> Dict[str, Any]:
-    """Compute real-time receiver benchmark and 8-sector polar coverage from local readsb files."""
+    """Compute real-time receiver benchmark and mtime-cached 8-sector polar coverage."""
+    global _outline_cache_mtime, _outline_cached_sectors, _outline_best_nm, _outline_best_brng
     bench: Dict[str, Any] = {
         "msg_rate": 0.0,
         "pos_rate": 0.0,
@@ -337,6 +415,7 @@ def compute_benchmark_stats() -> Dict[str, Any]:
         "gain_hint": "",
         "total_tracks": 0,
         "uptime_min": 0.0,
+        "feed_sources": list(_active_feed_sources),
         "sectors": [],
     }
     try:
@@ -362,7 +441,6 @@ def compute_benchmark_stats() -> Dict[str, Any]:
         bench["strong_pct"] = round(100.0 * l1loc.get("strong_signals", 0) / good, 2)
         bench["peak_dbfs"] = l1loc.get("peak_signal", 0.0)
         bench["est_ppm"] = st.get("estimated_ppm")
-        # >3% strong signals suggests front-end overload (gain too high); <0.5% suggests headroom
         sp = bench["strong_pct"]
         bench["gain_hint"] = "OVERLOAD: lower gain" if sp > 3.0 else ("headroom: could raise gain" if sp < 0.5 else "optimal")
 
@@ -375,36 +453,41 @@ def compute_benchmark_stats() -> Dict[str, Any]:
     except Exception:
         pass
 
-    sector_names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    sec_max = [0.0] * 8
-    sec_pts = [0] * 8
-    best_brng = 0.0
-    best_nm = 0.0
-
+    outline_path = os.path.join(READSB_DIR, "outline.json")
     try:
-        with open(os.path.join(READSB_DIR, "outline.json"), "r") as f:
-            outline = json.load(f)
-        for pt in outline.get("actualRange", {}).get("last24h", {}).get("points", []):
-            _, d_nm, brng = dist_bearing(SITE_LAT, SITE_LON, pt[0], pt[1])
-            idx = int(((brng + 22.5) % 360.0) // 45)
-            sec_pts[idx] += 1
-            if d_nm > sec_max[idx]:
-                sec_max[idx] = round(d_nm, 1)
-            if d_nm > best_nm:
-                best_nm = d_nm
-                best_brng = round(brng, 1)
+        mtime = os.stat(outline_path).st_mtime
+        if mtime != _outline_cache_mtime or not _outline_cached_sectors:
+            sector_names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+            sec_max = [0.0] * 8
+            sec_pts = [0] * 8
+            best_brng = 0.0
+            best_nm = 0.0
+            with open(outline_path, "r") as f:
+                outline = json.load(f)
+            for pt in outline.get("actualRange", {}).get("last24h", {}).get("points", []):
+                _, d_nm, brng = dist_bearing(SITE_LAT, SITE_LON, pt[0], pt[1])
+                idx = int(((brng + 22.5) % 360.0) // 45)
+                sec_pts[idx] += 1
+                if d_nm > sec_max[idx]:
+                    sec_max[idx] = round(d_nm, 1)
+                if d_nm > best_nm:
+                    best_nm = d_nm
+                    best_brng = round(brng, 1)
+            _outline_cache_mtime = mtime
+            _outline_best_nm = best_nm
+            _outline_best_brng = best_brng
+            _outline_cached_sectors = [
+                {"name": sector_names[i], "max_nm": sec_max[i], "points": sec_pts[i]}
+                for i in range(8)
+            ]
     except Exception:
         pass
 
-    if best_nm > bench["max_range_nm"]:
-        bench["max_range_nm"] = round(best_nm, 1)
-        bench["max_range_km"] = round(best_nm * 1.852, 1)
-    bench["max_range_brng"] = best_brng
-
-    bench["sectors"] = [
-        {"name": sector_names[i], "max_nm": sec_max[i], "points": sec_pts[i]}
-        for i in range(8)
-    ]
+    if _outline_best_nm > bench["max_range_nm"]:
+        bench["max_range_nm"] = round(_outline_best_nm, 1)
+        bench["max_range_km"] = round(_outline_best_nm * 1.852, 1)
+    bench["max_range_brng"] = _outline_best_brng
+    bench["sectors"] = _outline_cached_sectors
     return bench
 
 
@@ -588,6 +671,7 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
     bench = compute_benchmark_stats()
     bench["local_with_pos"] = local_with_pos
     bench["local_mode_s_only"] = local_mode_s_only
+    bench["open_unique_aircraft"] = len(cached_open)
     bench["furthest_live"] = furthest_local
 
     findings_summary = update_findings_log(local_ac_list, cached_open, classifications)
@@ -603,6 +687,31 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
     except Exception as exc:
         print(f"[augmentd] airports error: {exc}", flush=True)
         airport_status = []
+
+    # Attach resolved origin/destination routes to classifications for the Left Avionics Panel
+    cached_routes = airports_mod.get_cached_routes()
+    if cached_routes:
+        for hx, ac_obj in combined.items():
+            fl_cs = str(ac_obj.get("flight", "")).strip().upper()
+            rt = cached_routes.get(fl_cs) if fl_cs else None
+            if rt and rt.get("route_iata"):
+                cls_entry = classifications.get(hx)
+                if cls_entry:
+                    cls_entry["route"] = rt["route_iata"]
+                    cls_entry["route_verbose"] = f"{rt.get('orig_loc', '')} → {rt.get('dest_loc', '')}"
+                elif hx in local_by_hex:
+                    classifications[hx] = {
+                        "category": "LOCAL",
+                        "badge": "LOCAL",
+                        "label": "Local Antenna",
+                        "color": "#22c55e",
+                        "reg": str(ac_obj.get("r", "")).strip(),
+                        "type": str(ac_obj.get("t", "")).strip(),
+                        "desc": str(ac_obj.get("desc", "")).strip(),
+                        "route": rt["route_iata"],
+                        "route_verbose": f"{rt.get('orig_loc', '')} → {rt.get('dest_loc', '')}",
+                        "source": "LOCAL",
+                    }
 
     ui_version = "1"
     try:
@@ -630,6 +739,8 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
 
 
 _LAST_FINDINGS_WRITE = 0.0
+_CACHED_FINDINGS_DOC: Optional[Dict[str, Any]] = None
+_CACHED_BASELINE_DOC: Optional[Dict[str, Any]] = None
 
 
 def update_findings_log(
@@ -638,17 +749,20 @@ def update_findings_log(
     classifications: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Track decoder before/after performance and upstream tar1090-db discrepancies."""
-    global _LAST_FINDINGS_WRITE
+    global _LAST_FINDINGS_WRITE, _CACHED_FINDINGS_DOC, _CACHED_BASELINE_DOC
     now = time.time()
 
-    existing: Dict[str, Any] = {}
-    try:
-        if os.path.exists(FINDINGS_FILE):
-            with open(FINDINGS_FILE, "r") as f:
-                existing = json.load(f)
-    except Exception:
-        existing = {}
+    if _CACHED_FINDINGS_DOC is None:
+        try:
+            if os.path.exists(FINDINGS_FILE):
+                with open(FINDINGS_FILE, "r") as f:
+                    _CACHED_FINDINGS_DOC = json.load(f)
+            else:
+                _CACHED_FINDINGS_DOC = {}
+        except Exception:
+            _CACHED_FINDINGS_DOC = {}
 
+    existing = _CACHED_FINDINGS_DOC
     db_discrepancies: Dict[str, Any] = existing.get("db_discrepancies", {})
     local_only_hexes: Dict[str, Any] = existing.get("local_only_hexes", {})
 
@@ -720,10 +834,13 @@ def update_findings_log(
     try:
         with open(os.path.join(READSB_DIR, "stats.json"), "r") as f:
             st = json.load(f)
-        baseline = {}
-        if os.path.exists(BASELINE_FILE):
-            with open(BASELINE_FILE, "r") as f:
-                baseline = json.load(f)
+        if _CACHED_BASELINE_DOC is None:
+            if os.path.exists(BASELINE_FILE):
+                with open(BASELINE_FILE, "r") as f:
+                    _CACHED_BASELINE_DOC = json.load(f)
+            else:
+                _CACHED_BASELINE_DOC = {}
+        baseline = _CACHED_BASELINE_DOC
 
         # Use last15min if full, otherwise total since restart
         win = st.get("last15min", {})
@@ -732,7 +849,6 @@ def update_findings_log(
         dur_s = max(1.0, float(win.get("end", 1.0) - win.get("start", 0.0)))
         loc = win.get("local", {})
         acc = loc.get("accepted", [0, 0])
-        acc_0 = acc[0] if len(acc) > 0 else 0
         acc_1 = acc[1] if len(acc) > 1 else 0
         valid_msgs = max(1, int(win.get("messages_valid", 0) or 1))
         crc_1bit_pct = round((acc_1 / valid_msgs) * 100.0, 2)
@@ -787,16 +903,18 @@ def update_findings_log(
         "decoder_evaluation": decoder_eval,
     }
 
+    full_report = {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "summary": summary,
+        "decoder_evaluation": decoder_eval,
+        "db_discrepancies": db_discrepancies,
+        "local_only_hexes": local_only_hexes,
+    }
+    _CACHED_FINDINGS_DOC = full_report
+
     if now - _LAST_FINDINGS_WRITE >= 15.0 or not os.path.exists(FINDINGS_FILE):
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
-            full_report = {
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                "summary": summary,
-                "decoder_evaluation": decoder_eval,
-                "db_discrepancies": db_discrepancies,
-                "local_only_hexes": local_only_hexes,
-            }
             tmp_f = FINDINGS_FILE + ".tmp"
             with open(tmp_f, "w") as f:
                 json.dump(full_report, f, indent=2)
@@ -809,18 +927,18 @@ def update_findings_log(
 
 
 def main() -> None:
+    global _cached_open_feeds, _last_open_fetch_ts
     once = "--once" in sys.argv
-    cached_open: Dict[str, Dict[str, Any]] = {}
-    last_open_fetch = 0.0
+    # Initial synchronous seed so first cycle has full multi-feed data
+    _cached_open_feeds = fetch_open_feeds()
+    _last_open_fetch_ts = time.time()
+
     while True:
-        now = time.time()
-        if now - last_open_fetch >= 10.0:
-            new_open = fetch_open_feeds()
-            if new_open:
-                cached_open = new_open
-            last_open_fetch = now
+        refresh_open_feeds_async()
+        with _open_feed_lock:
+            snap = dict(_cached_open_feeds)
         try:
-            run_cycle(cached_open)
+            run_cycle(snap)
         except Exception as exc:
             print(f"[augmentd] cycle error: {exc}", flush=True)
         if once:

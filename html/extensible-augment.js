@@ -54,6 +54,10 @@
                 if (!plane.ownOp && srv.ownOp) {
                     plane.ownOp = srv.ownOp;
                 }
+                if (srv.route && !plane.augRoute) {
+                    plane.augRoute = srv.route;
+                    plane.augRouteVerbose = srv.route_verbose || "";
+                }
             }
 
             const reg = String(plane.registration || (srv && srv.reg) || "").toUpperCase();
@@ -324,9 +328,36 @@
         };
     }
 
-    // 3. Clean Map Overlay: Interactive Airport Pins + Tactical Target Lock Brackets (No distracting circles or sweep)
+    // 3. Clean Map Overlay: Event-Driven Interactive Airport Pins + Tactical Target Lock Brackets
     let radarCanvas = null;
     let radarCtx = null;
+    let overlayRafPending = false;
+    let lastHudHtml = "";
+    let lastAirportsHtml = "";
+    let lastBannerHtml = "";
+
+    function resizeRadarCanvas() {
+        const mapEl = document.getElementById("map_canvas");
+        if (!radarCanvas || !mapEl) return;
+        const dpr = window.devicePixelRatio || 1;
+        const w = mapEl.clientWidth || window.innerWidth;
+        const h = mapEl.clientHeight || window.innerHeight;
+        if (radarCanvas.width !== Math.round(w * dpr) || radarCanvas.height !== Math.round(h * dpr)) {
+            radarCanvas.width = Math.round(w * dpr);
+            radarCanvas.height = Math.round(h * dpr);
+            radarCanvas.style.width = w + "px";
+            radarCanvas.style.height = h + "px";
+        }
+    }
+
+    function scheduleOverlayDraw() {
+        if (overlayRafPending) return;
+        overlayRafPending = true;
+        requestAnimationFrame(function () {
+            overlayRafPending = false;
+            drawCleanOverlay(resizeRadarCanvas);
+        });
+    }
 
     const FLT_CAT_COLORS = { VFR: "#22c55e", MVFR: "#38bdf8", IFR: "#ef4444", LIFR: "#d946ef" };
 
@@ -379,24 +410,15 @@
         mapEl.appendChild(radarCanvas);
         radarCtx = radarCanvas.getContext("2d");
 
-        function resizeRadarCanvas() {
-            if (!radarCanvas || !mapEl) return;
-            const dpr = window.devicePixelRatio || 1;
-            const w = mapEl.clientWidth || window.innerWidth;
-            const h = mapEl.clientHeight || window.innerHeight;
-            if (radarCanvas.width !== Math.round(w * dpr) || radarCanvas.height !== Math.round(h * dpr)) {
-                radarCanvas.width = Math.round(w * dpr);
-                radarCanvas.height = Math.round(h * dpr);
-                radarCanvas.style.width = w + "px";
-                radarCanvas.style.height = h + "px";
-            }
-        }
-
-        window.addEventListener("resize", resizeRadarCanvas);
+        window.addEventListener("resize", function () {
+            resizeRadarCanvas();
+            scheduleOverlayDraw();
+        });
         resizeRadarCanvas();
 
         // Allow clicking an airport pin on the map to open its FIDS / METAR card
         mapEl.addEventListener("click", function (evt) {
+            scheduleOverlayDraw();
             if (!TacticalEngine.airportsOverlay || !TacticalEngine.airportScreenHitboxes.length) return;
             const rect = mapEl.getBoundingClientRect();
             const cx = evt.clientX - rect.left;
@@ -408,17 +430,19 @@
                     TacticalEngine.airportsPanelOpen = true;
                     renderAirportsPanel();
                     renderHud();
+                    scheduleOverlayDraw();
                     evt.stopPropagation();
                     return;
                 }
             }
         });
 
-        function renderOverlayLoop() {
-            drawCleanOverlay(resizeRadarCanvas);
-            requestAnimationFrame(renderOverlayLoop);
+        // Redraw overlay only when OpenLayers renders/pans or data updates (eliminates idle 60 FPS spin)
+        if (typeof OLMap !== "undefined" && OLMap.on) {
+            OLMap.on("postrender", scheduleOverlayDraw);
+            OLMap.on("moveend", scheduleOverlayDraw);
         }
-        requestAnimationFrame(renderOverlayLoop);
+        scheduleOverlayDraw();
     }
 
     function drawAirportMarkers(ctx, dpr, w, h) {
@@ -561,17 +585,24 @@
     }
 
     // 4. Redesigned Interactive Airport FIDS / ATIS Drawer
-    function renderFlightRow(ac, badgeSymbol, badgeColor) {
+    function renderFlightRow(ac, badgeSymbol, badgeColor, dirMode) {
         const altTxt = ac.alt === "ground" ? "GND" : (ac.alt != null ? `${Number(ac.alt).toLocaleString()}ft` : "--");
         const vr = ac.vr || 0;
         const vrArrow = vr < -200 ? "↓" : (vr > 200 ? "↑" : "");
         const gsTxt = ac.gs ? `${ac.gs}kt` : "";
-        const typeTxt = ac.type || "";
+        let tagTxt = ac.type || "";
+        if (ac.peer) {
+            const pfx = dirMode === "in" ? "←" : (dirMode === "out" ? "→" : "");
+            tagTxt = `${pfx}${ac.peer}${ac.type ? "·" + ac.type : ""}`;
+        } else if (ac.route) {
+            tagTxt = ac.route;
+        }
+        const routeTitle = ac.route ? `${ac.route}${ac.peer_loc ? " (" + ac.peer_loc + ")" : ""}` : (ac.desc || "");
         return `
-            <div class="fids-flight-row" data-fhex="${ac.hex}" data-flat="${ac.lat || ""}" data-flon="${ac.lon || ""}">
+            <div class="fids-flight-row" data-fhex="${ac.hex}" data-flat="${ac.lat || ""}" data-flon="${ac.lon || ""}" title="${routeTitle}">
                 <span class="fids-fl-sym" style="color:${badgeColor}">${badgeSymbol}</span>
                 <b class="fids-fl-call">${ac.flight}</b>
-                <span class="fids-fl-type">${typeTxt}</span>
+                <span class="fids-fl-type">${tagTxt}</span>
                 <span class="fids-fl-alt">${altTxt}${vrArrow}</span>
                 <span class="fids-fl-gs">${gsTxt}</span>
                 <span class="fids-fl-dst">${ac.dst_nm}NM</span>
@@ -636,7 +667,7 @@
         let inRows = "";
         if (selApt.inbound.length > 0) {
             for (let i = 0; i < selApt.inbound.length; i++) {
-                inRows += renderFlightRow(selApt.inbound[i], "▼", "#38bdf8");
+                inRows += renderFlightRow(selApt.inbound[i], "▼", "#38bdf8", "in");
             }
         } else {
             inRows = `<div class="fids-empty">No aircraft currently on approach</div>`;
@@ -645,19 +676,19 @@
         // Departures & Local/Ground column
         let outRows = "";
         for (let i = 0; i < selApt.departing.length; i++) {
-            outRows += renderFlightRow(selApt.departing[i], "▲", "#34d399");
+            outRows += renderFlightRow(selApt.departing[i], "▲", "#34d399", "out");
         }
         for (let i = 0; i < selApt.local.length; i++) {
-            outRows += renderFlightRow(selApt.local[i], "⟳", "#fbbf24");
+            outRows += renderFlightRow(selApt.local[i], "⟳", "#fbbf24", "loc");
         }
         for (let i = 0; i < selApt.ground.length; i++) {
-            outRows += renderFlightRow(selApt.ground[i], "⏚", "#94a3b8");
+            outRows += renderFlightRow(selApt.ground[i], "⏚", "#94a3b8", "gnd");
         }
         if (!outRows) {
             outRows = `<div class="fids-empty">No departures or surface traffic</div>`;
         }
 
-        el.innerHTML = `
+        const nextHtml = `
             <div class="fids-header">
                 <div class="fids-title-wrap">
                     <span class="fids-cat-pill" style="background:${catCol}25;border-color:${catCol};color:${catCol}">${cat}</span>
@@ -679,7 +710,8 @@
                 <div><span>TEMP/DP</span> <b>${tempTxt}</b></div>
                 <div><span>QNH</span> <b>${qnhTxt}</b></div>
             </div>
-            ${m && m.raw ? `<div class="fids-metar-raw">${m.raw}</div>` : ""}
+            ${m && m.raw ? `<div class="fids-metar-raw" title="${m.raw}"><b>METAR:</b> ${m.raw}</div>` : ""}
+            ${selApt.taf ? `<div class="fids-metar-raw" title="${selApt.taf}"><b>TAF:</b> ${selApt.taf}</div>` : ""}
             <div class="fids-board-grid">
                 <div class="fids-col">
                     <div class="fids-col-head"><span>▼ ARRIVALS / APPROACH</span> <b>${selApt.inbound.length}</b></div>
@@ -691,16 +723,21 @@
                 </div>
             </div>
         `;
+        if (nextHtml === lastAirportsHtml) return;
+        lastAirportsHtml = nextHtml;
+        el.innerHTML = nextHtml;
 
         // Wire events
         document.getElementById("fids-close").onclick = function () {
             TacticalEngine.airportsPanelOpen = false;
             renderAirportsPanel();
             renderHud();
+            scheduleOverlayDraw();
         };
         document.getElementById("fids-toggle-pins").onclick = function () {
             TacticalEngine.airportsOverlay = !TacticalEngine.airportsOverlay;
             renderAirportsPanel();
+            scheduleOverlayDraw();
         };
         document.getElementById("fids-center-apt").onclick = function () {
             OLMap.getView().animate({
@@ -715,6 +752,7 @@
             tabBtns[i].onclick = function () {
                 TacticalEngine.selectedAirportIcao = this.getAttribute("data-apt-icao");
                 renderAirportsPanel();
+                scheduleOverlayDraw();
             };
         }
 
@@ -759,6 +797,7 @@
             banner = document.createElement("div");
             banner.id = "tar1090-avionics-card-header";
             container.insertBefore(banner, container.firstChild);
+            lastBannerHtml = "";
         }
 
         const p = SelectedPlane;
@@ -768,17 +807,25 @@
         const modelText = p.typeLong || p.icaoType || "Aircraft";
         const typeCode = p.icaoType ? `ICAO: ${p.icaoType}` : "";
         const regText = p.registration ? `REG: ${p.registration}` : `HEX: ${String(p.icao).toUpperCase()}`;
-        const opText = p.ownOp || (p.getAirline && p.getAirline()) || "";
+        const opObj = p.getAirline && p.getAirline();
+        const opText = p.ownOp || (opObj && typeof opObj === "object" ? opObj.n : opObj) || "";
+        const routeCode = p.augRoute || p.routeString || "";
+        const routeVerb = p.augRouteVerbose || p.routeVerbose || "";
 
-        banner.innerHTML = `
+        const nextBannerHtml = `
             <div class="avionics-badge-row">
                 <span class="avionics-pill" style="background:${col}22;border-color:${col};color:${col};">${cat}</span>
                 <span class="avionics-sub">${badgeText}</span>
             </div>
             <div class="avionics-model">${modelText}</div>
             <div class="avionics-meta">${regText} ${typeCode ? "· " + typeCode : ""}</div>
+            ${routeCode ? `<div class="avionics-meta" style="color:#34d399;margin-top:2px;">✈ ${routeCode}${routeVerb ? " · " + routeVerb : ""}</div>` : ""}
             ${opText ? `<div class="avionics-op">${opText}</div>` : ""}
         `;
+        if (nextBannerHtml !== lastBannerHtml) {
+            lastBannerHtml = nextBannerHtml;
+            banner.innerHTML = nextBannerHtml;
+        }
     }
 
     // 6. Side-by-Side Split-Screen & Single Base Map Switcher
@@ -1321,7 +1368,7 @@
             }
             .fids-flight-row {
                 display: grid;
-                grid-template-columns: 12px 58px 36px 1fr 40px 40px;
+                grid-template-columns: 12px 54px 62px 1fr 36px 38px;
                 gap: 4px;
                 align-items: center;
                 font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -1340,6 +1387,9 @@
             }
             .fids-fl-type {
                 color: #38bdf8;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
             }
             .fids-fl-alt {
                 color: #cbd5e1;
@@ -1601,10 +1651,14 @@
             const furBtn = (fl && fl.hex)
                 ? `<button class="thud-btn" id="thud-furthest">★ Furthest: ${fl.flight} (${fl.dst_nm} NM)</button>`
                 : "";
+            const feedNames = Array.isArray(bench.feed_sources) && bench.feed_sources.length
+                ? bench.feed_sources.join("+")
+                : "adsb.fi+adsb.lol";
             rfPopoverHtml = `
                 <div class="thud-popover">
                     <span class="thud-stat">SNR: <b>${bench.snr_db || "--"} dB</b></span>
                     <span class="thud-stat">Gain: <b>${bench.gain_db || "--"} dB</b> (${bench.strong_pct != null ? bench.strong_pct : "--"}% strong · ${bench.gain_hint || "auto"})</span>
+                    <span class="thud-stat">Feeds: <b>${feedNames}</b> (${bench.open_unique_aircraft || 0})</span>
                     <button class="thud-btn ${TacticalEngine.rangeOutlineVisible ? "active" : ""}" id="thud-range-outline-btn">24h Outline: ${TacticalEngine.rangeOutlineVisible ? "ON" : "OFF"}</button>
                     ${furBtn}
                     ${cells ? `<div class="thud-polar-box">${cells}</div>` : ""}
@@ -1625,8 +1679,14 @@
             tacPopoverHtml = `<div class="thud-popover">${pills}</div>`;
         }
 
+        // Avoid clobbering the <select> dropdown while the user has it focused
+        const activeEl = document.activeElement;
+        if (activeEl && activeEl.id === "thud-map-select") {
+            return;
+        }
+
         const f = TacticalEngine.activeFilter;
-        container.innerHTML = `
+        const nextHudHtml = `
             <div class="thud-bar">
                 <button class="thud-btn" id="thud-home-btn" title="Center on Local Receiver">◉</button>
                 <button class="thud-btn rf-pill ${TacticalEngine.rfPopoverOpen ? "active" : ""}" id="thud-rf-btn" title="Click for RF Gain, SNR & 8-Sector Polar Range">
@@ -1651,6 +1711,9 @@
             ${rfPopoverHtml}
             ${tacPopoverHtml}
         `;
+        if (nextHudHtml === lastHudHtml) return;
+        lastHudHtml = nextHudHtml;
+        container.innerHTML = nextHudHtml;
 
         // Wire event listeners
         const homeBtn = document.getElementById("thud-home-btn");
@@ -1801,6 +1864,7 @@
                 updateLeftAircraftPanelBadge();
                 renderHud();
                 renderAirportsPanel();
+                scheduleOverlayDraw();
             })
             .catch(function () {});
     }
