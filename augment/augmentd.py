@@ -604,8 +604,16 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
         print(f"[augmentd] airports error: {exc}", flush=True)
         airport_status = []
 
+    ui_version = "1"
+    try:
+        with open("/usr/local/share/tar1090/html/version.json", "r") as vf:
+            ui_version = json.load(vf).get("tar1090Version", "1")
+    except Exception:
+        pass
+
     payload = {
         "now": now_ts,
+        "ui_version": ui_version,
         "uat_978": "true",
         "benchmark": bench,
         "findings_summary": findings_summary,

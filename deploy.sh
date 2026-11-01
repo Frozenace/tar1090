@@ -6,7 +6,7 @@ IPATH="/usr/local/share/tar1090"
 HTML_PATH="$IPATH/html"
 TMP="$IPATH/.instance_tmp"
 
-TAR_VERSION="$(cat "$PROJECT_DIR/version" 2>/dev/null || echo "custom")"
+TAR_VERSION="$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo "custom")-$(date +%s)"
 DB_VERSION="$(cat "$IPATH/git-db/version" 2>/dev/null || ls "$HTML_PATH" | grep '^db-' | sed 's/^db-//' | head -n1)"
 
 sudo rm -rf "$TMP"

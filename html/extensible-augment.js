@@ -17,6 +17,8 @@
         selectedAirportIcao: "EGSS",
         rfPopoverOpen: false,
         tacPopoverOpen: false,
+        rangeOutlineVisible: false,
+        uiVersion: null,
         splitCompare: false,
         splitRatio: 0.5,
         splitLeftMap: "osm",
@@ -300,13 +302,14 @@
             const savedFlight = this.flight;
             try {
                 let prefix = "";
-                if (this.tacticalBadge) {
+                if (
+                    this.tacticalBadge &&
+                    (this.tacticalCategory === "MIL" ||
+                        this.tacticalCategory === "NPAS" ||
+                        this.tacticalCategory === "HEMS" ||
+                        this.tacticalCategory === "SAR")
+                ) {
                     prefix = "[" + this.tacticalBadge + "] ";
-                } else if (this.coastedModeS) {
-                    prefix = "[COAST] ";
-                }
-                if (TacticalEngine.furthestHex && this.icao === TacticalEngine.furthestHex && !this.uat) {
-                    prefix = "🏆 " + prefix;
                 }
                 if (prefix) {
                     const baseName = (this.flight && this.flight.trim()) || this.registration || this.icao.toUpperCase();
@@ -346,12 +349,21 @@
             window.SiteCircles = false;
             if (typeof loStore !== "undefined") {
                 loStore["SiteCircles"] = "false";
+                if (!loStore["clean_map_v3_init"]) {
+                    loStore["clean_map_v3_init"] = "1";
+                    loStore["actual_range_outline"] = "false";
+                    if (typeof deselectAllTracks === "function") {
+                        deselectAllTracks();
+                    }
+                }
             }
             if (typeof layers_group !== "undefined" && typeof ol !== "undefined") {
                 ol.control.LayerSwitcher.forEachRecursive(layers_group, function (lyr) {
                     const nm = lyr.get("name");
-                    if (nm === "site_circles") {
+                    if (nm === "site_circles" || nm === "upintheair") {
                         lyr.setVisible(false);
+                    } else if (nm === "actual_range_outline") {
+                        lyr.setVisible(Boolean(TacticalEngine.rangeOutlineVisible));
                     }
                 });
             }
@@ -654,7 +666,7 @@
                     <span class="fids-apt-dist">${selApt.dist_nm} NM</span>
                 </div>
                 <div class="fids-actions">
-                    <button class="thud-btn" id="fids-center-apt" title="Center map on ${selApt.name}">📍 Map</button>
+                    <button class="thud-btn" id="fids-center-apt" title="Center map on ${selApt.name}">◉ Map</button>
                     <button class="thud-btn ${TacticalEngine.airportsOverlay ? "active" : ""}" id="fids-toggle-pins" title="Toggle airport pins on map">Pins: ${TacticalEngine.airportsOverlay ? "ON" : "OFF"}</button>
                     <button class="thud-btn" id="fids-close" title="Close Airport Board">✕</button>
                 </div>
@@ -1349,13 +1361,18 @@
                 text-align: center;
             }
 
+            /* Move OpenLayers layer-switcher button below top HUD bar so they never overlap */
+            .ol-layerswitcher, .layer-switcher {
+                top: 44px !important;
+            }
+
             /* Compact Single-Line Top Bar (#tar1090-tactical-hud) */
             #tar1090-tactical-hud {
                 position: fixed;
                 top: 6px;
-                left: 44px;
+                left: 8px;
                 z-index: 950;
-                background: rgba(11, 17, 32, 0.90);
+                background: rgba(11, 17, 32, 0.92);
                 backdrop-filter: blur(10px);
                 border: 1px solid rgba(56, 189, 248, 0.35);
                 border-radius: 8px;
@@ -1363,7 +1380,7 @@
                 color: #f8fafc;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 font-size: 11px;
-                max-width: calc(100vw - 175px);
+                max-width: calc(100vw - 210px);
                 box-shadow: 0 4px 16px rgba(0, 0, 0, 0.65);
                 user-select: none;
             }
@@ -1567,7 +1584,7 @@
         for (let i = 0; i < mapPresets.length; i++) {
             const mp = mapPresets[i];
             const sel = (typeof MapType_tar1090 !== "undefined" && MapType_tar1090 === mp.id) ? "selected" : "";
-            mapOpts += `<option value="${mp.id}" ${sel}>🗺️ ${mp.label}</option>`;
+            mapOpts += `<option value="${mp.id}" ${sel}>▤ ${mp.label}</option>`;
         }
 
         // Optional expandable RF Diagnostics & Polar Range Popover
@@ -1582,12 +1599,13 @@
                 }
             }
             const furBtn = (fl && fl.hex)
-                ? `<button class="thud-btn" id="thud-furthest">🏆 Furthest: ${fl.flight} (${fl.dst_nm} NM)</button>`
+                ? `<button class="thud-btn" id="thud-furthest">★ Furthest: ${fl.flight} (${fl.dst_nm} NM)</button>`
                 : "";
             rfPopoverHtml = `
                 <div class="thud-popover">
                     <span class="thud-stat">SNR: <b>${bench.snr_db || "--"} dB</b></span>
                     <span class="thud-stat">Gain: <b>${bench.gain_db || "--"} dB</b> (${bench.strong_pct != null ? bench.strong_pct : "--"}% strong · ${bench.gain_hint || "auto"})</span>
+                    <button class="thud-btn ${TacticalEngine.rangeOutlineVisible ? "active" : ""}" id="thud-range-outline-btn">24h Outline: ${TacticalEngine.rangeOutlineVisible ? "ON" : "OFF"}</button>
                     ${furBtn}
                     ${cells ? `<div class="thud-polar-box">${cells}</div>` : ""}
                 </div>
@@ -1610,17 +1628,17 @@
         const f = TacticalEngine.activeFilter;
         container.innerHTML = `
             <div class="thud-bar">
-                <button class="thud-btn" id="thud-home-btn" title="Center on Local Receiver">🎯</button>
+                <button class="thud-btn" id="thud-home-btn" title="Center on Local Receiver">◉</button>
                 <button class="thud-btn rf-pill ${TacticalEngine.rfPopoverOpen ? "active" : ""}" id="thud-rf-btn" title="Click for RF Gain, SNR & 8-Sector Polar Range">
-                    📡 <b>${bench.max_range_nm || "--"} NM</b> · <b>${bench.msg_rate || "--"}</b>/s ▾
+                    RF <b>${bench.max_range_nm || "--"} NM</b> · <b>${bench.msg_rate || "--"}</b>/s ▾
                 </button>
                 <span class="thud-sep"></span>
                 <button class="thud-btn ${f === "ALL" ? "active" : ""}" data-filter="ALL">ALL</button>
-                <button class="thud-btn ${f === "MIL" ? "active" : ""}" data-filter="MIL">⚔️ ${milCount}</button>
-                <button class="thud-btn ${f === "NPAS" ? "active" : ""}" data-filter="NPAS">🚓 ${npasCount}</button>
-                <button class="thud-btn ${f === "HEMS_SAR" ? "active" : ""}" data-filter="HEMS_SAR">🚁 ${hemsSarCount}</button>
-                <button class="thud-btn ${f === "LOCAL_ONLY" ? "active" : ""}" data-filter="LOCAL_ONLY" title="Show only aircraft heard directly by your local antenna">📡 Local</button>
-                <button class="thud-btn ${TacticalEngine.augmentEnabled ? "active" : ""}" id="thud-aug-toggle" title="Toggle Hybrid MLAT / Open-Data Augmentation">🌐 Aug</button>
+                <button class="thud-btn ${f === "MIL" ? "active" : ""}" data-filter="MIL">⚔ MIL ${milCount}</button>
+                <button class="thud-btn ${f === "NPAS" ? "active" : ""}" data-filter="NPAS">★ NPAS ${npasCount}</button>
+                <button class="thud-btn ${f === "HEMS_SAR" ? "active" : ""}" data-filter="HEMS_SAR">✚ HEMS ${hemsSarCount}</button>
+                <button class="thud-btn ${f === "LOCAL_ONLY" ? "active" : ""}" data-filter="LOCAL_ONLY" title="Show only aircraft heard directly by your local antenna">◉ Local</button>
+                <button class="thud-btn ${TacticalEngine.augmentEnabled ? "active" : ""}" id="thud-aug-toggle" title="Toggle Hybrid MLAT / Open-Data Augmentation">✦ Aug</button>
                 <span class="thud-sep"></span>
                 <button class="thud-btn ${TacticalEngine.airportsPanelOpen ? "active" : ""}" id="thud-apt-btn" title="Open Interactive Airport Arrivals/Departures & METAR Board">
                     ✈ Airports${totalAirportMovements > 0 ? " (" + totalAirportMovements + ")" : ""}
@@ -1628,7 +1646,7 @@
                 ${tacList.length > 0 ? `<button class="thud-btn tactical-pill ${TacticalEngine.tacPopoverOpen ? "active" : ""}" id="thud-tac-btn">⚡ Tactical (${tacList.length}) ▾</button>` : ""}
                 <span class="thud-sep"></span>
                 <select class="thud-select" id="thud-map-select" title="Switch Base Map">${mapOpts}</select>
-                <button class="thud-btn ${TacticalEngine.splitCompare ? "active" : ""}" id="thud-split-btn" title="Compare Two Maps Side-by-Side">⚖️</button>
+                <button class="thud-btn ${TacticalEngine.splitCompare ? "active" : ""}" id="thud-split-btn" title="Compare Two Maps Side-by-Side">◫</button>
             </div>
             ${rfPopoverHtml}
             ${tacPopoverHtml}
@@ -1669,6 +1687,14 @@
         if (furBtn && fl) {
             furBtn.onclick = function () {
                 focusAircraft(fl.hex);
+            };
+        }
+        const roBtn = document.getElementById("thud-range-outline-btn");
+        if (roBtn) {
+            roBtn.onclick = function () {
+                TacticalEngine.rangeOutlineVisible = !TacticalEngine.rangeOutlineVisible;
+                disableConcentricRangeCircles();
+                renderHud();
             };
         }
         const augBtn = document.getElementById("thud-aug-toggle");
@@ -1723,6 +1749,13 @@
             })
             .then(function (data) {
                 if (!data) return;
+                if (data.ui_version) {
+                    if (TacticalEngine.uiVersion && TacticalEngine.uiVersion !== data.ui_version) {
+                        window.location.reload();
+                        return;
+                    }
+                    TacticalEngine.uiVersion = data.ui_version;
+                }
                 TacticalEngine.latestAugment = data;
                 TacticalEngine.classifications = data.classifications || {};
                 if (data.benchmark && data.benchmark.furthest_live) {

@@ -502,19 +502,19 @@ SiteShow = true;
 SiteName = "Local ADS-B Receiver";
 SiteCircles = false;
 
-actual_range_show = true;
+actual_range_show = false;
 actual_range_outline_color = '#06b6d4';
-actual_range_outline_width = 1.6;
+actual_range_outline_width = 1.4;
 
-// High-visibility icons, trails, and labels for 800x480 touchscreen
-iconScale = 1.3;
-outlineWidth = 1.25;
-lineWidth = 2.2;
-defaultAllTracks = true;
+// Clean icons and labels (trails only shown for selected aircraft)
+iconScale = 1.15;
+outlineWidth = 1.2;
+lineWidth = 2.0;
+defaultAllTracks = false;
 defaultLabels = true;
 defaultExtendedLabels = 0;
-labelScale = 1.15;
-headingLineMinutes = 2;
+labelScale = 0.90;
+headingLineMinutes = 1;
 useRouteAPI = true;
 
 // Compact table columns for 800x480 screen width
