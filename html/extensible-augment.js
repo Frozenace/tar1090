@@ -2,8 +2,9 @@
 "use strict";
 
 /**
- * Extensible Tactical Classification, Open-Data Augmentation, ATC Radar Scope,
- * Modernized Avionics Left Panel, Side-by-Side HD Map Comparator & Benchmark HUD.
+ * Extensible Tactical Classification, Open-Data Augmentation,
+ * Interactive Airport FIDS/METAR Board, Modernized Avionics Left Panel,
+ * Side-by-Side HD Map Comparator & Compact Single-Line Top Bar.
  */
 (function () {
     const TacticalEngine = {
@@ -11,11 +12,11 @@
         activeFilter: "ALL", // ALL, MIL, NPAS, HEMS_SAR, LOCAL_ONLY
         augmentEnabled: true,
         deadReckoningEnabled: true,
-        radarScopeEnabled: true,
         airportsOverlay: true,
-        airportsPanelOpen: true,
-        polarOpen: false,
-        hudCollapsed: false,
+        airportsPanelOpen: false,
+        selectedAirportIcao: "EGSS",
+        rfPopoverOpen: false,
+        tacPopoverOpen: false,
         splitCompare: false,
         splitRatio: 0.5,
         splitLeftMap: "osm",
@@ -24,7 +25,7 @@
         classifications: {},
         furthestHex: null,
         furthestNm: 0,
-        sweepAngleDeg: 0,
+        airportScreenHitboxes: [],
 
         registerCategory: function (cat) {
             this.categories.push(cat);
@@ -35,7 +36,6 @@
             const hx = String(plane.icao).toLowerCase();
             const srv = this.classifications[hx];
 
-            // Enrich from server open-data metadata if local DB lacked it, and trigger shape lookup
             if (srv) {
                 if (!plane.registration && srv.reg) {
                     plane.registration = srv.reg;
@@ -205,8 +205,6 @@
                 this.augSource = "LOCAL";
             }
 
-            // Ensure server-supplied type / reg / desc / ownOp from readsb --db-file-lt or augmented.json
-            // immediately populate the PlaneObject so true airframe shapes render on first frame
             if (data) {
                 if (data.r && !this.registration) this.registration = String(data.r);
                 if (data.desc && !this.typeLong) this.typeLong = String(data.desc);
@@ -221,7 +219,6 @@
 
             origUpdateData.call(this, now, last, data, init);
 
-            // Make sure typeDescription & wtc are resolved from g.type_cache as soon as g.type_cache is ready
             if (this.icaoType && !this.typeDescription && typeof g !== "undefined" && g.type_cache) {
                 this.icaoTypeCache = null;
                 if (typeof this.setTypeData === "function") {
@@ -324,11 +321,44 @@
         };
     }
 
-    // 3. Real-Time ATC Radar Scope Overlay (Phosphor Sweep, Compass Rose, Range Rings & Target Locks)
+    // 3. Clean Map Overlay: Interactive Airport Pins + Tactical Target Lock Brackets (No distracting circles or sweep)
     let radarCanvas = null;
     let radarCtx = null;
 
-    function initRadarScopeOverlay() {
+    const FLT_CAT_COLORS = { VFR: "#22c55e", MVFR: "#38bdf8", IFR: "#ef4444", LIFR: "#d946ef" };
+
+    function fmtWind(m) {
+        if (!m) return "No METAR";
+        if (m.wspd === 0 || m.wspd == null) return "Calm";
+        const dir = (typeof m.wdir === "number") ? String(Math.round(m.wdir)).padStart(3, "0") : "VRB";
+        return `${dir}°/${m.wspd}${m.wgst ? "G" + m.wgst : ""}kt`;
+    }
+
+    function fmtVis(m) {
+        if (!m || m.vis_sm == null) return "--";
+        const v = Number(m.vis_sm);
+        if (isNaN(v)) return String(m.vis_sm);
+        return v >= 6.2 ? "10km+" : (v * 1.609).toFixed(v < 1 ? 1 : 0) + "km";
+    }
+
+    function disableConcentricRangeCircles() {
+        try {
+            window.SiteCircles = false;
+            if (typeof loStore !== "undefined") {
+                loStore["SiteCircles"] = "false";
+            }
+            if (typeof layers_group !== "undefined" && typeof ol !== "undefined") {
+                ol.control.LayerSwitcher.forEachRecursive(layers_group, function (lyr) {
+                    const nm = lyr.get("name");
+                    if (nm === "site_circles") {
+                        lyr.setVisible(false);
+                    }
+                });
+            }
+        } catch (e) {}
+    }
+
+    function initMapCanvasOverlay() {
         const mapEl = document.getElementById("map_canvas");
         if (!mapEl || document.getElementById("tar1090-radar-overlay")) return;
 
@@ -353,158 +383,119 @@
         window.addEventListener("resize", resizeRadarCanvas);
         resizeRadarCanvas();
 
-        let lastFrameTs = performance.now();
-        function animateRadarLoop(nowTs) {
-            const dt = Math.min(0.1, (nowTs - lastFrameTs) / 1000.0);
-            lastFrameTs = nowTs;
-            if (TacticalEngine.radarScopeEnabled) {
-                // 36 degrees per second = 10s full 360° radar sweep (6 RPM ATC Terminal Radar)
-                TacticalEngine.sweepAngleDeg = (TacticalEngine.sweepAngleDeg + dt * 36.0) % 360.0;
-                drawRadarScope(resizeRadarCanvas);
-            } else if (radarCtx && radarCanvas) {
-                radarCtx.clearRect(0, 0, radarCanvas.width, radarCanvas.height);
+        // Allow clicking an airport pin on the map to open its FIDS / METAR card
+        mapEl.addEventListener("click", function (evt) {
+            if (!TacticalEngine.airportsOverlay || !TacticalEngine.airportScreenHitboxes.length) return;
+            const rect = mapEl.getBoundingClientRect();
+            const cx = evt.clientX - rect.left;
+            const cy = evt.clientY - rect.top;
+            for (let i = 0; i < TacticalEngine.airportScreenHitboxes.length; i++) {
+                const hb = TacticalEngine.airportScreenHitboxes[i];
+                if (cx >= hb.x1 && cx <= hb.x2 && cy >= hb.y1 && cy <= hb.y2) {
+                    TacticalEngine.selectedAirportIcao = hb.icao;
+                    TacticalEngine.airportsPanelOpen = true;
+                    renderAirportsPanel();
+                    renderHud();
+                    evt.stopPropagation();
+                    return;
+                }
             }
-            requestAnimationFrame(animateRadarLoop);
+        });
+
+        function renderOverlayLoop() {
+            drawCleanOverlay(resizeRadarCanvas);
+            requestAnimationFrame(renderOverlayLoop);
         }
-        requestAnimationFrame(animateRadarLoop);
-    }
-
-    // Airport overlay: runway axis, ICAO + wind/visibility label coloured by flight category
-    const FLT_CAT_COLORS = { VFR: "#22c55e", MVFR: "#3b82f6", IFR: "#ef4444", LIFR: "#d946ef" };
-
-    function fmtWind(m) {
-        if (!m) return "no METAR";
-        if (m.wspd === 0 || m.wspd == null) return "calm";
-        const dir = (typeof m.wdir === "number") ? String(Math.round(m.wdir)).padStart(3, "0") : "VRB";
-        return `${dir}°/${m.wspd}${m.wgst ? "G" + m.wgst : ""}kt`;
-    }
-
-    function fmtVis(m) {
-        if (!m || m.vis_sm == null) return "--";
-        const v = Number(m.vis_sm);
-        if (isNaN(v)) return String(m.vis_sm);
-        return v >= 6.2 ? "10km+" : (v * 1.609).toFixed(v < 1 ? 1 : 0) + "km";
+        requestAnimationFrame(renderOverlayLoop);
     }
 
     function drawAirportMarkers(ctx, dpr, w, h) {
         const aug = TacticalEngine.latestAugment;
+        TacticalEngine.airportScreenHitboxes = [];
         if (!TacticalEngine.airportsOverlay || !aug || !Array.isArray(aug.airports)) return;
         const zoom = OLMap.getView().getZoom() || 9;
         ctx.save();
         ctx.textBaseline = "middle";
+
         for (let i = 0; i < aug.airports.length; i++) {
             const a = aug.airports[i];
             const px = OLMap.getPixelFromCoordinate(ol.proj.fromLonLat([a.lon, a.lat]));
             if (!px) continue;
             const x = px[0] * dpr, y = px[1] * dpr;
-            if (x < -60 || y < -60 || x > w + 60 || y > h + 60) continue;
-            const m = a.metar;
-            const col = (m && FLT_CAT_COLORS[m.cat]) || "#94a3b8";
+            if (x < -50 || y < -50 || x > w + 50 || y > h + 50) continue;
 
-            // runway axis, ~1.5 NM long at current zoom (min 8px so it stays visible zoomed out)
+            const m = a.metar;
+            const col = (m && FLT_CAT_COLORS[m.cat]) || "#64748b";
+            const isSel = TacticalEngine.airportsPanelOpen && TacticalEngine.selectedAirportIcao === a.icao;
+            const totalMoves = (a.inbound ? a.inbound.length : 0) + (a.departing ? a.departing.length : 0) + (a.local ? a.local.length : 0);
+
+            // Runway centerline segment scaled cleanly to zoom
             const res = OLMap.getView().getResolution() || 1;
-            const nmPx = 1852 / (res * Math.cos(a.lat * Math.PI / 180)); // CSS px per NM
-            const half = Math.max(8 * dpr, Math.min(60 * dpr, 0.75 * nmPx * dpr));
+            const nmPx = 1852 / (res * Math.cos(a.lat * Math.PI / 180));
+            const half = Math.max(6 * dpr, Math.min(36 * dpr, 0.65 * nmPx * dpr));
             const rad = ((a.axis - 90) * Math.PI) / 180.0;
-            ctx.strokeStyle = col;
-            ctx.lineWidth = 2.4 * dpr;
+
+            ctx.strokeStyle = isSel ? "#38bdf8" : col;
+            ctx.lineWidth = (isSel ? 3.0 : 2.0) * dpr;
             ctx.beginPath();
             ctx.moveTo(x - half * Math.cos(rad), y - half * Math.sin(rad));
             ctx.lineTo(x + half * Math.cos(rad), y + half * Math.sin(rad));
             ctx.stroke();
+
+            // Center dot
             ctx.beginPath();
-            ctx.arc(x, y, 3 * dpr, 0, Math.PI * 2);
-            ctx.fillStyle = col;
+            ctx.arc(x, y, (isSel ? 4.2 : 3.0) * dpr, 0, Math.PI * 2);
+            ctx.fillStyle = isSel ? "#38bdf8" : col;
             ctx.fill();
 
-            if (zoom < 7.5) continue;
-            const line1 = a.icao + (a.active_rwy ? "  RWY " + a.active_rwy : "");
-            const line2 = m ? `${fmtWind(m)} · vis ${fmtVis(m)} · ${m.clouds}` : "no METAR";
-            ctx.font = `700 ${Math.round(10.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
-            const w1 = ctx.measureText(line1).width;
-            ctx.font = `600 ${Math.round(9.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
-            const w2 = ctx.measureText(line2).width;
-            const bw = Math.max(w1, w2) + 10 * dpr, bh = 29 * dpr;
-            const bx = x + 10 * dpr, by = y - bh / 2;
-            ctx.fillStyle = "rgba(11,17,32,0.82)";
+            // Compact, non-distracting pill tag (only ICAO + active runway / traffic count)
+            if (zoom < 8.0 && !totalMoves && !isSel) {
+                TacticalEngine.airportScreenHitboxes.push({
+                    icao: a.icao,
+                    x1: px[0] - 10,
+                    y1: px[1] - 10,
+                    x2: px[0] + 10,
+                    y2: px[1] + 10
+                });
+                continue;
+            }
+
+            let tag = a.icao;
+            if (a.active_rwy && zoom >= 8.8) {
+                tag += "·" + a.active_rwy;
+            }
+            if (totalMoves > 0) {
+                tag += ` (${totalMoves})`;
+            }
+
+            ctx.font = `700 ${Math.round(9.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
+            const tw = ctx.measureText(tag).width;
+            const bw = tw + 9 * dpr;
+            const bh = 15 * dpr;
+            const bx = x + 7 * dpr;
+            const by = y - bh / 2;
+
+            ctx.fillStyle = isSel ? "rgba(2, 132, 199, 0.92)" : "rgba(11, 17, 32, 0.80)";
             ctx.fillRect(bx, by, bw, bh);
             ctx.fillStyle = col;
-            ctx.fillRect(bx, by, 3 * dpr, bh);
-            ctx.font = `700 ${Math.round(10.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
-            ctx.fillStyle = "#f8fafc";
+            ctx.fillRect(bx, by, 2.5 * dpr, bh);
+
+            ctx.fillStyle = isSel ? "#ffffff" : "#e2e8f0";
             ctx.textAlign = "left";
-            ctx.fillText(line1, bx + 7 * dpr, by + 9 * dpr);
-            ctx.font = `600 ${Math.round(9.5 * dpr)}px ui-monospace, Menlo, Consolas, monospace`;
-            ctx.fillStyle = "#cbd5e1";
-            ctx.fillText(line2, bx + 7 * dpr, by + 21 * dpr);
+            ctx.fillText(tag, bx + 5 * dpr, by + bh / 2 + 0.5 * dpr);
+
+            TacticalEngine.airportScreenHitboxes.push({
+                icao: a.icao,
+                x1: px[0] - 8,
+                y1: (by / dpr) - 3,
+                x2: ((bx + bw) / dpr) + 4,
+                y2: ((by + bh) / dpr) + 3
+            });
         }
         ctx.restore();
     }
 
-    function renderAirportsPanel() {
-        let el = document.getElementById("tar1090-airports-panel");
-        const aug = TacticalEngine.latestAugment;
-        if (!aug || !Array.isArray(aug.airports)) return;
-        if (!el) {
-            el = document.createElement("div");
-            el.id = "tar1090-airports-panel";
-            document.body.appendChild(el);
-        }
-        if (!TacticalEngine.airportsPanelOpen) {
-            el.innerHTML = `<button class="thud-btn" id="apt-expand">✈ Airports ▴</button>`;
-            document.getElementById("apt-expand").onclick = function () {
-                TacticalEngine.airportsPanelOpen = true;
-                renderAirportsPanel();
-            };
-            return;
-        }
-        let rows = "";
-        for (let i = 0; i < aug.airports.length; i++) {
-            const a = aug.airports[i];
-            const m = a.metar;
-            const col = (m && FLT_CAT_COLORS[m.cat]) || "#64748b";
-            const counts = `<span title="inbound">▼${a.inbound.length}</span> <span title="departing">▲${a.departing.length}</span> <span title="local / circuit">⟳${a.local.length}</span> <span title="on ground">⏚${a.ground.length}</span>`;
-            const tip = m ? m.raw.replace(/"/g, "&quot;") : "No METAR available";
-            rows += `<div class="apt-row" data-lat="${a.lat}" data-lon="${a.lon}" title="${tip}">
-                <span class="apt-dot" style="background:${col}"></span>
-                <b class="apt-icao">${a.icao}</b>
-                <span class="apt-name">${a.name}</span>
-                <span class="apt-wx">${m ? m.cat : "--"} · ${fmtWind(m)} · ${fmtVis(m)} · ${m ? m.clouds : ""} · Q${m && m.qnh ? Math.round(m.qnh) : "--"}</span>
-                <span class="apt-rwy">${a.active_rwy ? "RWY " + a.active_rwy : a.rwy_pair}</span>
-                <span class="apt-cnt">${counts}</span>
-                <span class="apt-dist">${a.dist_nm}NM</span>
-            </div>`;
-        }
-        el.innerHTML = `
-            <div class="apt-head">
-                <b>✈ Nearby Airports</b>
-                <span>
-                    <button class="thud-btn ${TacticalEngine.airportsOverlay ? "active" : ""}" id="apt-overlay">Map: ${TacticalEngine.airportsOverlay ? "ON" : "OFF"}</button>
-                    <button class="thud-btn" id="apt-collapse">▾</button>
-                </span>
-            </div>
-            <div class="apt-body">${rows}</div>`;
-        document.getElementById("apt-collapse").onclick = function () {
-            TacticalEngine.airportsPanelOpen = false;
-            renderAirportsPanel();
-        };
-        document.getElementById("apt-overlay").onclick = function () {
-            TacticalEngine.airportsOverlay = !TacticalEngine.airportsOverlay;
-            renderAirportsPanel();
-        };
-        const rowEls = el.querySelectorAll(".apt-row");
-        for (let i = 0; i < rowEls.length; i++) {
-            rowEls[i].onclick = function () {
-                OLMap.getView().animate({
-                    center: ol.proj.fromLonLat([Number(this.getAttribute("data-lon")), Number(this.getAttribute("data-lat"))]),
-                    zoom: Math.max(OLMap.getView().getZoom() || 9, 11),
-                    duration: 400
-                });
-            };
-        }
-    }
-
-    function drawRadarScope(resizeFn) {
+    function drawCleanOverlay(resizeFn) {
         if (!radarCanvas || !radarCtx || typeof OLMap === "undefined" || typeof ol === "undefined") return;
         resizeFn();
         const dpr = window.devicePixelRatio || 1;
@@ -515,137 +506,9 @@
 
         drawAirportMarkers(ctx, dpr, w, h);
 
-        if (!TacticalEngine.radarScopeEnabled) return;
-
-        const sLat = (typeof SiteLat === "number") ? SiteLat : 51.9202;
-        const sLon = (typeof SiteLon === "number") ? SiteLon : 0.8978;
-        const centerCoord = ol.proj.fromLonLat([sLon, sLat]);
-        const centerPx = OLMap.getPixelFromCoordinate(centerCoord);
-        if (!centerPx) return;
-
-        const cx = centerPx[0] * dpr;
-        const cy = centerPx[1] * dpr;
-
-        // Calculate pixel radius for a given Nautical Miles distance at SiteLat
-        function nmToPixels(nm) {
-            const dLat = nm / 60.0;
-            const edgeCoord = ol.proj.fromLonLat([sLon, sLat + dLat]);
-            const edgePx = OLMap.getPixelFromCoordinate(edgeCoord);
-            if (!edgePx) return nm * 2;
-            const dx = (edgePx[0] - centerPx[0]) * dpr;
-            const dy = (edgePx[1] - centerPx[1]) * dpr;
-            return Math.sqrt(dx * dx + dy * dy);
-        }
-
-        const r25 = nmToPixels(25);
-        const r50 = nmToPixels(50);
-        const r100 = nmToPixels(100);
-        const r150 = nmToPixels(150);
-        const sweepRadius = r150;
-
-        ctx.save();
-
-        // 1. Subtle CRT Radar Scope Vignette & Crosshairs
-        ctx.strokeStyle = "rgba(16, 185, 129, 0.16)";
-        ctx.lineWidth = 1 * dpr;
-        ctx.setLineDash([6 * dpr, 6 * dpr]);
-        ctx.beginPath();
-        ctx.moveTo(cx - sweepRadius, cy);
-        ctx.lineTo(cx + sweepRadius, cy);
-        ctx.moveTo(cx, cy - sweepRadius);
-        ctx.lineTo(cx, cy + sweepRadius);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // 2. Range Rings (25, 50, 100, 150 NM) with Glowing Phosphor Labels
-        const rings = [
-            { nm: 25, r: r25 },
-            { nm: 50, r: r50 },
-            { nm: 100, r: r100 },
-            { nm: 150, r: r150 }
-        ];
-        ctx.font = `600 ${Math.round(10 * dpr)}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
-        for (let i = 0; i < rings.length; i++) {
-            const rg = rings[i];
-            if (rg.r < 18 * dpr) continue;
-            ctx.beginPath();
-            ctx.arc(cx, cy, rg.r, 0, Math.PI * 2);
-            ctx.strokeStyle = (rg.nm === 100 || rg.nm === 150)
-                ? "rgba(16, 185, 129, 0.34)"
-                : "rgba(56, 189, 248, 0.22)";
-            ctx.lineWidth = (rg.nm === 150 ? 1.5 : 1.0) * dpr;
-            ctx.stroke();
-
-            // Label at 015° bearing on each ring
-            const lblAngle = (-75 * Math.PI) / 180.0;
-            const lx = cx + rg.r * Math.cos(lblAngle);
-            const ly = cy + rg.r * Math.sin(lblAngle);
-            ctx.fillStyle = "rgba(11, 17, 32, 0.78)";
-            ctx.fillRect(lx - 18 * dpr, ly - 7 * dpr, 38 * dpr, 13 * dpr);
-            ctx.fillStyle = "rgba(52, 211, 153, 0.92)";
-            ctx.fillText(`${rg.nm}NM`, lx - 14 * dpr, ly + 3 * dpr);
-        }
-
-        // 3. Outer 360° Azimuth Compass Rose on the 100 NM (or 150 NM) ring
-        const roseR = r100 > 90 * dpr && r100 < Math.min(w, h) * 0.46 ? r100 : r150;
-        if (roseR > 45 * dpr) {
-            for (let deg = 0; deg < 360; deg += 5) {
-                const rad = ((deg - 90) * Math.PI) / 180.0;
-                const isMajor = (deg % 30 === 0);
-                const isMed = (deg % 10 === 0);
-                const tickLen = (isMajor ? 9 : (isMed ? 5 : 2.5)) * dpr;
-                const x1 = cx + (roseR - tickLen) * Math.cos(rad);
-                const y1 = cy + (roseR - tickLen) * Math.sin(rad);
-                const x2 = cx + roseR * Math.cos(rad);
-                const y2 = cy + roseR * Math.sin(rad);
-
-                ctx.beginPath();
-                ctx.moveTo(x1, y1);
-                ctx.lineTo(x2, y2);
-                ctx.strokeStyle = isMajor ? "rgba(52, 211, 153, 0.55)" : "rgba(56, 189, 248, 0.25)";
-                ctx.lineWidth = (isMajor ? 1.4 : 0.9) * dpr;
-                ctx.stroke();
-
-                if (isMajor) {
-                    const tx = cx + (roseR + 13 * dpr) * Math.cos(rad);
-                    const ty = cy + (roseR + 13 * dpr) * Math.sin(rad);
-                    ctx.fillStyle = (deg % 90 === 0) ? "#34d399" : "rgba(148, 163, 184, 0.78)";
-                    ctx.textAlign = "center";
-                    ctx.textBaseline = "middle";
-                    const cardinal = deg === 0 ? "000° N" : (deg === 90 ? "090° E" : (deg === 180 ? "180° S" : (deg === 270 ? "270° W" : String(deg).padStart(3, "0") + "°")));
-                    ctx.fillText(cardinal, tx, ty);
-                }
-            }
-        }
-
-        // 4. Rotating Radar Phosphor Sweep Cone
-        const headRad = ((TacticalEngine.sweepAngleDeg - 90) * Math.PI) / 180.0;
-        const trailSpanRad = (34 * Math.PI) / 180.0;
-        const slices = 22;
-        for (let s = 0; s < slices; s++) {
-            const frac0 = s / slices;
-            const frac1 = (s + 1) / slices;
-            const a0 = headRad - trailSpanRad * (1 - frac0);
-            const a1 = headRad - trailSpanRad * (1 - frac1);
-            const alpha = Math.pow(frac1, 2.2) * 0.16;
-            ctx.beginPath();
-            ctx.moveTo(cx, cy);
-            ctx.arc(cx, cy, sweepRadius, a0, a1);
-            ctx.closePath();
-            ctx.fillStyle = `rgba(16, 185, 129, ${alpha.toFixed(4)})`;
-            ctx.fill();
-        }
-
-        // Bright Leading Radar Beam Line
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(cx + sweepRadius * Math.cos(headRad), cy + sweepRadius * Math.sin(headRad));
-        ctx.strokeStyle = "rgba(52, 211, 153, 0.78)";
-        ctx.lineWidth = 1.8 * dpr;
-        ctx.stroke();
-
-        // 5. Tactical Target Lock Brackets on Active NPAS / HEMS / SAR / MIL & Selected Aircraft
+        // Tactical Target Lock Brackets on Active NPAS / HEMS / SAR / MIL & Selected Aircraft
         if (typeof g !== "undefined" && Array.isArray(g.planesOrdered)) {
+            ctx.save();
             for (let i = 0; i < g.planesOrdered.length; i++) {
                 const p = g.planesOrdered[i];
                 if (!p || !p.visible || !p.position) continue;
@@ -661,48 +524,200 @@
                 if (tx < 0 || ty < 0 || tx > w || ty > h) continue;
 
                 const col = p.tacticalColor || (p.selected ? "#38bdf8" : "#34d399");
-                const box = (p.selected ? 17 : 14) * dpr;
-                const corner = 5 * dpr;
+                const box = (p.selected ? 16 : 13) * dpr;
+                const corner = 4.5 * dpr;
 
                 ctx.strokeStyle = col;
-                ctx.lineWidth = 1.6 * dpr;
+                ctx.lineWidth = 1.5 * dpr;
                 ctx.beginPath();
-                // Top-left bracket
                 ctx.moveTo(tx - box, ty - box + corner);
                 ctx.lineTo(tx - box, ty - box);
                 ctx.lineTo(tx - box + corner, ty - box);
-                // Top-right bracket
                 ctx.moveTo(tx + box - corner, ty - box);
                 ctx.lineTo(tx + box, ty - box);
                 ctx.lineTo(tx + box, ty - box + corner);
-                // Bottom-right bracket
                 ctx.moveTo(tx + box, ty + box - corner);
                 ctx.lineTo(tx + box, ty + box);
                 ctx.lineTo(tx + box - corner, ty + box);
-                // Bottom-left bracket
                 ctx.moveTo(tx - box + corner, ty + box);
                 ctx.lineTo(tx - box, ty + box);
                 ctx.lineTo(tx - box, ty + box - corner);
                 ctx.stroke();
-
-                // Velocity leader vector line (30s projected track)
-                if (p.rotation != null && p.gs > 30) {
-                    const trkRad = ((p.rotation - 90) * Math.PI) / 180.0;
-                    const vecLen = Math.min(42, Math.max(16, p.gs / 10)) * dpr;
-                    ctx.beginPath();
-                    ctx.moveTo(tx + (box * 0.8) * Math.cos(trkRad), ty + (box * 0.8) * Math.sin(trkRad));
-                    ctx.lineTo(tx + (box + vecLen) * Math.cos(trkRad), ty + (box + vecLen) * Math.sin(trkRad));
-                    ctx.strokeStyle = col;
-                    ctx.lineWidth = 1.2 * dpr;
-                    ctx.stroke();
-                }
             }
+            ctx.restore();
         }
-
-        ctx.restore();
     }
 
-    // 4. Modernize the Left Aircraft Telemetry Panel (#selected_infoblock) & Dark Avionics Theme
+    // 4. Redesigned Interactive Airport FIDS / ATIS Drawer
+    function renderFlightRow(ac, badgeSymbol, badgeColor) {
+        const altTxt = ac.alt === "ground" ? "GND" : (ac.alt != null ? `${Number(ac.alt).toLocaleString()}ft` : "--");
+        const vr = ac.vr || 0;
+        const vrArrow = vr < -200 ? "↓" : (vr > 200 ? "↑" : "");
+        const gsTxt = ac.gs ? `${ac.gs}kt` : "";
+        const typeTxt = ac.type || "";
+        return `
+            <div class="fids-flight-row" data-fhex="${ac.hex}" data-flat="${ac.lat || ""}" data-flon="${ac.lon || ""}">
+                <span class="fids-fl-sym" style="color:${badgeColor}">${badgeSymbol}</span>
+                <b class="fids-fl-call">${ac.flight}</b>
+                <span class="fids-fl-type">${typeTxt}</span>
+                <span class="fids-fl-alt">${altTxt}${vrArrow}</span>
+                <span class="fids-fl-gs">${gsTxt}</span>
+                <span class="fids-fl-dst">${ac.dst_nm}NM</span>
+            </div>
+        `;
+    }
+
+    function renderAirportsPanel() {
+        let el = document.getElementById("tar1090-airports-panel");
+        const aug = TacticalEngine.latestAugment;
+        if (!aug || !Array.isArray(aug.airports) || !aug.airports.length) return;
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "tar1090-airports-panel";
+            document.body.appendChild(el);
+        }
+
+        if (!TacticalEngine.airportsPanelOpen) {
+            el.style.display = "none";
+            return;
+        }
+        el.style.display = "block";
+
+        // Pick selected airport (or default to first airport with METAR/traffic)
+        let selApt = null;
+        for (let i = 0; i < aug.airports.length; i++) {
+            if (aug.airports[i].icao === TacticalEngine.selectedAirportIcao) {
+                selApt = aug.airports[i];
+                break;
+            }
+        }
+        if (!selApt) {
+            selApt = aug.airports[0];
+            TacticalEngine.selectedAirportIcao = selApt.icao;
+        }
+
+        // Build top airport selector tabs (prioritize airports with METAR or active traffic)
+        let tabsHtml = "";
+        for (let i = 0; i < aug.airports.length; i++) {
+            const a = aug.airports[i];
+            const m = a.metar;
+            const col = (m && FLT_CAT_COLORS[m.cat]) || "#64748b";
+            const cnt = a.inbound.length + a.departing.length + a.local.length + a.ground.length;
+            const isAct = (a.icao === selApt.icao) ? "active" : "";
+            tabsHtml += `
+                <button class="fids-tab ${isAct}" data-apt-icao="${a.icao}" title="${a.name} (${a.dist_nm} NM)">
+                    <span class="apt-dot" style="background:${col}"></span>
+                    <span>${a.icao}</span>
+                    ${cnt > 0 ? `<span class="fids-tab-cnt">${cnt}</span>` : ""}
+                </button>
+            `;
+        }
+
+        const m = selApt.metar;
+        const cat = (m && m.cat) || "N/A";
+        const catCol = (m && FLT_CAT_COLORS[m.cat]) || "#64748b";
+        const rwyLabel = selApt.active_rwy ? `RWY ${selApt.active_rwy} ACTIVE` : `RWY ${selApt.rwy_pair}`;
+        const qnhTxt = (m && m.qnh) ? `${Math.round(m.qnh)} hPa` : "--";
+        const tempTxt = (m && m.temp != null) ? `${Math.round(m.temp)}°C / ${m.dewp != null ? Math.round(m.dewp) + "°C" : "--"}` : "--";
+
+        // Arrivals column (Inbound)
+        let inRows = "";
+        if (selApt.inbound.length > 0) {
+            for (let i = 0; i < selApt.inbound.length; i++) {
+                inRows += renderFlightRow(selApt.inbound[i], "▼", "#38bdf8");
+            }
+        } else {
+            inRows = `<div class="fids-empty">No aircraft currently on approach</div>`;
+        }
+
+        // Departures & Local/Ground column
+        let outRows = "";
+        for (let i = 0; i < selApt.departing.length; i++) {
+            outRows += renderFlightRow(selApt.departing[i], "▲", "#34d399");
+        }
+        for (let i = 0; i < selApt.local.length; i++) {
+            outRows += renderFlightRow(selApt.local[i], "⟳", "#fbbf24");
+        }
+        for (let i = 0; i < selApt.ground.length; i++) {
+            outRows += renderFlightRow(selApt.ground[i], "⏚", "#94a3b8");
+        }
+        if (!outRows) {
+            outRows = `<div class="fids-empty">No departures or surface traffic</div>`;
+        }
+
+        el.innerHTML = `
+            <div class="fids-header">
+                <div class="fids-title-wrap">
+                    <span class="fids-cat-pill" style="background:${catCol}25;border-color:${catCol};color:${catCol}">${cat}</span>
+                    <b class="fids-apt-title">${selApt.icao} · ${selApt.name}</b>
+                    <span class="fids-rwy-pill">${rwyLabel}</span>
+                    <span class="fids-apt-dist">${selApt.dist_nm} NM</span>
+                </div>
+                <div class="fids-actions">
+                    <button class="thud-btn" id="fids-center-apt" title="Center map on ${selApt.name}">📍 Map</button>
+                    <button class="thud-btn ${TacticalEngine.airportsOverlay ? "active" : ""}" id="fids-toggle-pins" title="Toggle airport pins on map">Pins: ${TacticalEngine.airportsOverlay ? "ON" : "OFF"}</button>
+                    <button class="thud-btn" id="fids-close" title="Close Airport Board">✕</button>
+                </div>
+            </div>
+            <div class="fids-tabs-bar">${tabsHtml}</div>
+            <div class="fids-wx-strip">
+                <div><span>WIND</span> <b>${fmtWind(m)}</b></div>
+                <div><span>VIS</span> <b>${fmtVis(m)}</b></div>
+                <div><span>CLOUDS</span> <b>${m ? m.clouds : "--"}</b></div>
+                <div><span>TEMP/DP</span> <b>${tempTxt}</b></div>
+                <div><span>QNH</span> <b>${qnhTxt}</b></div>
+            </div>
+            ${m && m.raw ? `<div class="fids-metar-raw">${m.raw}</div>` : ""}
+            <div class="fids-board-grid">
+                <div class="fids-col">
+                    <div class="fids-col-head"><span>▼ ARRIVALS / APPROACH</span> <b>${selApt.inbound.length}</b></div>
+                    <div class="fids-col-list">${inRows}</div>
+                </div>
+                <div class="fids-col">
+                    <div class="fids-col-head"><span>▲ DEPARTURES / CIRCUIT / GND</span> <b>${selApt.departing.length + selApt.local.length + selApt.ground.length}</b></div>
+                    <div class="fids-col-list">${outRows}</div>
+                </div>
+            </div>
+        `;
+
+        // Wire events
+        document.getElementById("fids-close").onclick = function () {
+            TacticalEngine.airportsPanelOpen = false;
+            renderAirportsPanel();
+            renderHud();
+        };
+        document.getElementById("fids-toggle-pins").onclick = function () {
+            TacticalEngine.airportsOverlay = !TacticalEngine.airportsOverlay;
+            renderAirportsPanel();
+        };
+        document.getElementById("fids-center-apt").onclick = function () {
+            OLMap.getView().animate({
+                center: ol.proj.fromLonLat([selApt.lon, selApt.lat]),
+                zoom: Math.max(OLMap.getView().getZoom() || 9, 11.2),
+                duration: 350
+            });
+        };
+
+        const tabBtns = el.querySelectorAll("[data-apt-icao]");
+        for (let i = 0; i < tabBtns.length; i++) {
+            tabBtns[i].onclick = function () {
+                TacticalEngine.selectedAirportIcao = this.getAttribute("data-apt-icao");
+                renderAirportsPanel();
+            };
+        }
+
+        const flRows = el.querySelectorAll(".fids-flight-row");
+        for (let i = 0; i < flRows.length; i++) {
+            flRows[i].onclick = function () {
+                const hx = this.getAttribute("data-fhex");
+                const lt = this.getAttribute("data-flat");
+                const ln = this.getAttribute("data-flon");
+                focusAircraft(hx, lt ? Number(lt) : null, ln ? Number(ln) : null);
+            };
+        }
+    }
+
+    // 5. Modernize the Left Aircraft Telemetry Panel (#selected_infoblock) & Dark Avionics Theme
     function applyDarkAvionicsTheme() {
         const root = document.documentElement;
         root.style.setProperty("--BGCOLOR1", "#0b1120");
@@ -716,6 +731,7 @@
         if (typeof jQuery !== "undefined") {
             jQuery(".infoblockCloseBox, .settingsCloseBox").css("filter", "invert(100%)");
         }
+        disableConcentricRangeCircles();
     }
 
     function updateLeftAircraftPanelBadge() {
@@ -753,7 +769,7 @@
         `;
     }
 
-    // 5. Side-by-Side Split-Screen & Single Base Map Switcher
+    // 6. Side-by-Side Split-Screen & Single Base Map Switcher
     function getPresetInfo(mapId) {
         const list = window.HudMapPresets || [];
         for (let i = 0; i < list.length; i++) {
@@ -820,6 +836,7 @@
     function applyMapVisibility() {
         if (typeof layers_group === "undefined" || typeof ol === "undefined") return;
         installSplitClipHooks();
+        disableConcentricRangeCircles();
 
         if (!TacticalEngine.splitCompare) {
             ol.control.LayerSwitcher.forEachRecursive(layers_group, function (lyr) {
@@ -950,11 +967,11 @@
         }
     }
 
-    // 6. Inject Modern Avionics CSS for Left Panel (#selected_infoblock), Radar Canvas & HUD
+    // 7. Inject Clean Avionics CSS for Single-Line Top Bar, Interactive Airport Board & Left Panel
     function injectStyles() {
         const style = document.createElement("style");
         style.textContent = `
-            /* Radar Scope Canvas */
+            /* Map Overlay Canvas */
             #tar1090-radar-overlay {
                 position: absolute;
                 top: 0;
@@ -969,10 +986,10 @@
             #selected_infoblock {
                 position: absolute !important;
                 left: 10px !important;
-                top: 102px !important;
+                top: 46px !important;
                 bottom: 12px !important;
                 height: auto !important;
-                max-height: calc(100vh - 116px) !important;
+                max-height: calc(100vh - 60px) !important;
                 width: 248px !important;
                 z-index: 900 !important;
                 background: rgba(11, 17, 32, 0.92) !important;
@@ -1119,46 +1136,220 @@
                 font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
             }
 
-            /* Airports panel */
+            /*Redesigned Interactive Airport FIDS / ATIS Drawer */
             #tar1090-airports-panel {
                 position: fixed;
-                left: 270px;
+                left: 12px;
                 bottom: 34px;
-                z-index: 940;
-                width: min(640px, calc(100vw - 560px));
-                min-width: 360px;
-                background: rgba(11, 17, 32, 0.92);
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(56, 189, 248, 0.35);
-                border-radius: 10px;
-                box-shadow: 0 6px 22px rgba(0, 0, 0, 0.65);
+                z-index: 945;
+                width: min(560px, calc(100vw - 26px));
+                background: rgba(11, 17, 32, 0.95);
+                backdrop-filter: blur(14px);
+                border: 1px solid rgba(56, 189, 248, 0.42);
+                border-radius: 12px;
+                box-shadow: 0 12px 34px rgba(0, 0, 0, 0.78);
                 color: #f1f5f9;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                font-size: 10.5px;
-                padding: 5px 7px;
+                font-size: 11px;
+                padding: 8px 10px;
             }
-            .apt-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
-            .apt-body { max-height: 190px; overflow-y: auto; }
-            .apt-row {
-                display: grid;
-                grid-template-columns: 10px 38px 1fr auto 52px auto 44px;
-                gap: 6px;
+            .fids-header {
+                display: flex;
+                justify-content: space-between;
                 align-items: center;
-                padding: 2px 3px;
+                gap: 6px;
+                margin-bottom: 6px;
+            }
+            .fids-title-wrap {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .fids-cat-pill {
+                font-size: 9.5px;
+                font-weight: 800;
+                padding: 1px 6px;
                 border-radius: 4px;
+                border: 1px solid;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+            }
+            .fids-apt-title {
+                font-size: 12.5px;
+                color: #f8fafc;
+            }
+            .fids-rwy-pill {
+                background: rgba(251, 191, 36, 0.16);
+                border: 1px solid rgba(251, 191, 36, 0.55);
+                color: #fde68a;
+                font-size: 9.5px;
+                font-weight: 700;
+                padding: 1px 6px;
+                border-radius: 4px;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+            }
+            .fids-apt-dist {
+                color: #94a3b8;
+                font-size: 10px;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+            }
+            .fids-actions {
+                display: flex;
+                gap: 4px;
+            }
+            .fids-tabs-bar {
+                display: flex;
+                gap: 4px;
+                overflow-x: auto;
+                padding-bottom: 5px;
+                margin-bottom: 6px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            .fids-tabs-bar::-webkit-scrollbar {
+                height: 3px;
+            }
+            .fids-tabs-bar::-webkit-scrollbar-thumb {
+                background: rgba(56, 189, 248, 0.35);
+                border-radius: 3px;
+            }
+            .fids-tab {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                background: rgba(30, 41, 59, 0.78);
+                border: 1px solid rgba(148, 163, 184, 0.25);
+                border-radius: 6px;
+                padding: 2px 7px;
+                color: #cbd5e1;
+                font-size: 10px;
+                font-weight: 700;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
                 cursor: pointer;
                 white-space: nowrap;
             }
-            .apt-row:hover { background: rgba(51, 65, 85, 0.7); }
-            .apt-dot { width: 8px; height: 8px; border-radius: 50%; }
-            .apt-icao { font-family: ui-monospace, Menlo, Consolas, monospace; color: #38bdf8; }
-            .apt-name { overflow: hidden; text-overflow: ellipsis; color: #cbd5e1; }
-            .apt-wx { font-family: ui-monospace, Menlo, Consolas, monospace; color: #e2e8f0; }
-            .apt-rwy { color: #fbbf24; font-weight: 700; }
-            .apt-cnt { color: #94a3b8; font-family: ui-monospace, Menlo, Consolas, monospace; }
-            .apt-dist { color: #64748b; text-align: right; }
+            .fids-tab:hover {
+                background: rgba(51, 65, 85, 0.9);
+                color: #fff;
+            }
+            .fids-tab.active {
+                background: rgba(2, 132, 199, 0.35);
+                border-color: #38bdf8;
+                color: #fff;
+            }
+            .fids-tab-cnt {
+                background: rgba(56, 189, 248, 0.25);
+                color: #7dd3fc;
+                border-radius: 8px;
+                padding: 0 4px;
+                font-size: 9px;
+            }
+            .apt-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                display: inline-block;
+            }
+            .fids-wx-strip {
+                display: grid;
+                grid-template-columns: repeat(5, 1fr);
+                gap: 4px;
+                background: rgba(15, 23, 42, 0.85);
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                border-radius: 6px;
+                padding: 4px 7px;
+                margin-bottom: 4px;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+                font-size: 10px;
+            }
+            .fids-wx-strip span {
+                display: block;
+                font-size: 8.5px;
+                color: #64748b;
+                font-weight: 700;
+            }
+            .fids-wx-strip b {
+                color: #e2e8f0;
+            }
+            .fids-metar-raw {
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+                font-size: 9.5px;
+                color: #94a3b8;
+                background: rgba(15, 23, 42, 0.5);
+                padding: 3px 6px;
+                border-radius: 4px;
+                margin-bottom: 6px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .fids-board-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+            }
+            .fids-col {
+                background: rgba(15, 23, 42, 0.65);
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                border-radius: 6px;
+                padding: 4px 6px;
+            }
+            .fids-col-head {
+                display: flex;
+                justify-content: space-between;
+                font-size: 9.5px;
+                font-weight: 800;
+                color: #94a3b8;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+                padding-bottom: 3px;
+                margin-bottom: 4px;
+            }
+            .fids-col-list {
+                max-height: 120px;
+                overflow-y: auto;
+            }
+            .fids-flight-row {
+                display: grid;
+                grid-template-columns: 12px 58px 36px 1fr 40px 40px;
+                gap: 4px;
+                align-items: center;
+                font-family: ui-monospace, Menlo, Consolas, monospace;
+                font-size: 10px;
+                padding: 2px 3px;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+            .fids-flight-row:hover {
+                background: rgba(56, 189, 248, 0.2);
+            }
+            .fids-fl-call {
+                color: #f8fafc;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .fids-fl-type {
+                color: #38bdf8;
+            }
+            .fids-fl-alt {
+                color: #cbd5e1;
+                text-align: right;
+            }
+            .fids-fl-gs {
+                color: #94a3b8;
+                text-align: right;
+            }
+            .fids-fl-dst {
+                color: #64748b;
+                text-align: right;
+            }
+            .fids-empty {
+                color: #64748b;
+                font-size: 10px;
+                font-style: italic;
+                padding: 6px 2px;
+                text-align: center;
+            }
 
-            /* Top Tactical HUD */
+            /* Compact Single-Line Top Bar (#tar1090-tactical-hud) */
             #tar1090-tactical-hud {
                 position: fixed;
                 top: 6px;
@@ -1166,36 +1357,33 @@
                 z-index: 950;
                 background: rgba(11, 17, 32, 0.90);
                 backdrop-filter: blur(10px);
-                border: 1px solid rgba(52, 211, 153, 0.4);
+                border: 1px solid rgba(56, 189, 248, 0.35);
                 border-radius: 8px;
-                padding: 5px 8px;
+                padding: 4px 7px;
                 color: #f8fafc;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 font-size: 11px;
-                max-width: calc(100vw - 190px);
+                max-width: calc(100vw - 175px);
                 box-shadow: 0 4px 16px rgba(0, 0, 0, 0.65);
                 user-select: none;
             }
-            .thud-row {
+            .thud-bar {
                 display: flex;
                 align-items: center;
-                flex-wrap: wrap;
+                flex-wrap: nowrap;
                 gap: 4px;
-                margin-bottom: 4px;
+                overflow-x: auto;
+                scrollbar-width: none;
             }
-            .thud-row:last-child {
-                margin-bottom: 0;
+            .thud-bar::-webkit-scrollbar {
+                display: none;
             }
-            .thud-stat {
-                background: rgba(30, 41, 59, 0.9);
-                border: 1px solid rgba(148, 163, 184, 0.25);
-                border-radius: 5px;
-                padding: 2px 6px;
-                font-weight: 600;
-                white-space: nowrap;
-            }
-            .thud-stat b {
-                color: #34d399;
+            .thud-sep {
+                width: 1px;
+                height: 15px;
+                background: rgba(148, 163, 184, 0.28);
+                margin: 0 2px;
+                flex-shrink: 0;
             }
             .thud-btn {
                 background: rgba(30, 41, 59, 0.9);
@@ -1207,6 +1395,7 @@
                 font-weight: 600;
                 cursor: pointer;
                 white-space: nowrap;
+                flex-shrink: 0;
                 transition: all 0.12s ease;
             }
             .thud-btn:hover {
@@ -1218,15 +1407,55 @@
                 color: #ffffff;
                 border-color: #38bdf8;
             }
-            .thud-btn.radar-active {
-                background: rgba(16, 185, 129, 0.25);
-                color: #6ee7b7;
-                border-color: #10b981;
+            .thud-btn.rf-pill b {
+                color: #34d399;
             }
-            .thud-btn.split-left-active {
-                background: #7c3aed;
-                color: #ffffff;
-                border-color: #c084fc;
+            .thud-select {
+                background: rgba(30, 41, 59, 0.92);
+                color: #f8fafc;
+                border: 1px solid rgba(56, 189, 248, 0.4);
+                border-radius: 5px;
+                padding: 2px 5px;
+                font-size: 10.5px;
+                font-weight: 600;
+                cursor: pointer;
+                flex-shrink: 0;
+            }
+            .thud-popover {
+                margin-top: 5px;
+                padding-top: 5px;
+                border-top: 1px solid rgba(148, 163, 184, 0.22);
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 5px;
+            }
+            .thud-stat {
+                background: rgba(30, 41, 59, 0.9);
+                border: 1px solid rgba(148, 163, 184, 0.25);
+                border-radius: 5px;
+                padding: 2px 6px;
+                font-size: 10px;
+                font-weight: 600;
+                white-space: nowrap;
+            }
+            .thud-stat b {
+                color: #34d399;
+            }
+            .thud-polar-box {
+                width: 100%;
+                display: grid;
+                grid-template-columns: repeat(8, 1fr);
+                gap: 3px;
+                margin-top: 2px;
+            }
+            .thud-sector {
+                background: rgba(15, 23, 42, 0.85);
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                border-radius: 4px;
+                padding: 2px 4px;
+                text-align: center;
+                font-size: 9.5px;
             }
             .thud-btn.tactical-pill {
                 background: rgba(245, 158, 11, 0.18);
@@ -1243,22 +1472,8 @@
                 border-color: #f87171;
                 color: #fecaca;
             }
-            .thud-polar-box {
-                margin-top: 5px;
-                padding-top: 5px;
-                border-top: 1px solid rgba(148, 163, 184, 0.25);
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 4px;
-            }
-            .thud-sector {
-                background: rgba(15, 23, 42, 0.85);
-                border: 1px solid rgba(148, 163, 184, 0.2);
-                border-radius: 4px;
-                padding: 2px 5px;
-                text-align: center;
-                font-size: 10px;
-            }
+
+            /* Split Map Divider */
             #tar1090-split-divider {
                 position: absolute;
                 top: 0;
@@ -1322,6 +1537,7 @@
         const aug = TacticalEngine.latestAugment;
         const bench = (aug && aug.benchmark) || {};
         const tacList = (aug && aug.tactical_active) || [];
+        const apts = (aug && aug.airports) || [];
         const fl = bench.furthest_live;
 
         let milCount = 0, npasCount = 0, hemsSarCount = 0;
@@ -1332,17 +1548,9 @@
             else if (c === "HEMS" || c === "SAR") hemsSarCount++;
         }
 
-        if (TacticalEngine.hudCollapsed) {
-            container.innerHTML = `
-                <div class="thud-row">
-                    <button class="thud-btn radar-active" id="thud-expand">🟢 RADAR HUD (${bench.max_range_nm || "--"} NM | Tac: ${tacList.length}) ▾</button>
-                </div>
-            `;
-            document.getElementById("thud-expand").onclick = function () {
-                TacticalEngine.hudCollapsed = false;
-                renderHud();
-            };
-            return;
+        let totalAirportMovements = 0;
+        for (let i = 0; i < apts.length; i++) {
+            totalAirportMovements += (apts[i].inbound ? apts[i].inbound.length : 0) + (apts[i].departing ? apts[i].departing.length : 0);
         }
 
         const mapPresets = window.HudMapPresets || [
@@ -1352,98 +1560,78 @@
             { id: "carto_rastertiles/voyager", label: "Voyager HD", bg: "#f5f3f0" },
             { id: "esri", label: "Satellite", bg: "#0b151e" },
             { id: "opentopo", label: "Terrain", bg: "#e8e4d8" },
-            { id: "osm", label: "OSM (Old)", bg: "#aad3df" }
+            { id: "osm", label: "OSM", bg: "#aad3df" }
         ];
 
-        let mapRowsHtml = "";
-        if (!TacticalEngine.splitCompare) {
-            let mapButtonsHtml = "";
-            for (let i = 0; i < mapPresets.length; i++) {
-                const mp = mapPresets[i];
-                const isAct = (typeof MapType_tar1090 !== "undefined" && MapType_tar1090 === mp.id) ? "active" : "";
-                mapButtonsHtml += `<button class="thud-btn ${isAct}" data-map="${mp.id}">${mp.label}</button>`;
+        let mapOpts = "";
+        for (let i = 0; i < mapPresets.length; i++) {
+            const mp = mapPresets[i];
+            const sel = (typeof MapType_tar1090 !== "undefined" && MapType_tar1090 === mp.id) ? "selected" : "";
+            mapOpts += `<option value="${mp.id}" ${sel}>🗺️ ${mp.label}</option>`;
+        }
+
+        // Optional expandable RF Diagnostics & Polar Range Popover
+        let rfPopoverHtml = "";
+        if (TacticalEngine.rfPopoverOpen) {
+            let cells = "";
+            if (Array.isArray(bench.sectors)) {
+                for (let i = 0; i < bench.sectors.length; i++) {
+                    const s = bench.sectors[i];
+                    const col = s.max_nm >= 100 ? "#4ade80" : (s.max_nm < 50 ? "#f87171" : "#38bdf8");
+                    cells += `<div class="thud-sector"><b>${s.name}</b> <span style="color:${col}">${s.max_nm}NM</span></div>`;
+                }
             }
-            mapRowsHtml = `
-                <div class="thud-row">
-                    <span style="color:#94a3b8;font-weight:600;">🗺️ Map:</span>
-                    ${mapButtonsHtml}
-                    <button class="thud-btn" id="thud-split-btn" title="Compare two maps side-by-side">⚖️ Split Compare</button>
-                </div>
-            `;
-        } else {
-            let leftBtns = "", rightBtns = "";
-            for (let i = 0; i < mapPresets.length; i++) {
-                const mp = mapPresets[i];
-                const lAct = (TacticalEngine.splitLeftMap === mp.id) ? "split-left-active" : "";
-                const rAct = (TacticalEngine.splitRightMap === mp.id) ? "active" : "";
-                leftBtns += `<button class="thud-btn ${lAct}" data-split-left="${mp.id}">${mp.label}</button>`;
-                rightBtns += `<button class="thud-btn ${rAct}" data-split-right="${mp.id}">${mp.label}</button>`;
-            }
-            mapRowsHtml = `
-                <div class="thud-row">
-                    <span style="color:#c084fc;font-weight:700;">◀ Left:</span>
-                    ${leftBtns}
-                    <button class="thud-btn active" id="thud-split-btn">✖ Exit Split</button>
-                </div>
-                <div class="thud-row">
-                    <span style="color:#38bdf8;font-weight:700;">Right ▶:</span>
-                    ${rightBtns}
+            const furBtn = (fl && fl.hex)
+                ? `<button class="thud-btn" id="thud-furthest">🏆 Furthest: ${fl.flight} (${fl.dst_nm} NM)</button>`
+                : "";
+            rfPopoverHtml = `
+                <div class="thud-popover">
+                    <span class="thud-stat">SNR: <b>${bench.snr_db || "--"} dB</b></span>
+                    <span class="thud-stat">Gain: <b>${bench.gain_db || "--"} dB</b> (${bench.strong_pct != null ? bench.strong_pct : "--"}% strong · ${bench.gain_hint || "auto"})</span>
+                    ${furBtn}
+                    ${cells ? `<div class="thud-polar-box">${cells}</div>` : ""}
                 </div>
             `;
         }
 
-        let furthestHtml = "";
-        if (fl && fl.hex) {
-            furthestHtml = `<button class="thud-btn" id="thud-furthest" title="Click to jump to furthest local aircraft">🏆 ${fl.flight} (${fl.dst_nm} NM)</button>`;
-        }
-
-        let tacTickerHtml = "";
-        if (tacList.length > 0) {
-            const topTac = tacList.slice(0, 4);
+        // Optional expandable Active Tactical Popover
+        let tacPopoverHtml = "";
+        if (TacticalEngine.tacPopoverOpen && tacList.length > 0) {
             let pills = "";
+            const topTac = tacList.slice(0, 6);
             for (let i = 0; i < topTac.length; i++) {
                 const t = topTac[i];
                 const altTxt = t.alt != null ? `${t.alt}ft` : "";
                 pills += `<button class="thud-btn tactical-pill ${t.category}" data-fhex="${t.hex}" data-flat="${t.lat || ""}" data-flon="${t.lon || ""}">[${t.badge}] ${t.flight} ${t.type ? "(" + t.type + ")" : ""} ${altTxt} · ${Math.round(t.dst_nm || 0)}NM</button>`;
             }
-            tacTickerHtml = `<div class="thud-row"><span style="color:#94a3b8;font-weight:600;">Active Tactical:</span>${pills}</div>`;
-        }
-
-        let polarHtml = "";
-        if (TacticalEngine.polarOpen && Array.isArray(bench.sectors)) {
-            let cells = "";
-            for (let i = 0; i < bench.sectors.length; i++) {
-                const s = bench.sectors[i];
-                const col = s.max_nm >= 100 ? "#4ade80" : (s.max_nm < 50 ? "#f87171" : "#38bdf8");
-                cells += `<div class="thud-sector"><b>${s.name}</b>: <span style="color:${col}">${s.max_nm} NM</span></div>`;
-            }
-            polarHtml = `<div class="thud-polar-box">${cells}</div>`;
+            tacPopoverHtml = `<div class="thud-popover">${pills}</div>`;
         }
 
         const f = TacticalEngine.activeFilter;
         container.innerHTML = `
-            <div class="thud-row">
-                <button class="thud-btn" id="thud-home-btn" title="Center on Local Receiver Site">🎯 Home</button>
-                <button class="thud-btn ${TacticalEngine.radarScopeEnabled ? "radar-active" : ""}" id="thud-radar-btn" title="Toggle Rotating ATC Radar Sweep & Compass Rose">🟢 Radar Scope: ${TacticalEngine.radarScopeEnabled ? "ON" : "OFF"}</button>
-                <span class="thud-stat">📡 Max: <b>${bench.max_range_nm || "--"} NM</b></span>
-                <span class="thud-stat">⚡ <b>${bench.msg_rate || "--"}</b> msg/s</span>
-                <span class="thud-stat">SNR: <b>${bench.snr_db || "--"} dB</b></span>
-                <span class="thud-stat" title="Strong-signal share of decoded messages. >3% = front-end overload, <0.5% = headroom">🎚 ${bench.gain_db || "--"} dB · <b>${bench.strong_pct != null ? bench.strong_pct : "--"}%</b> strong · ${bench.gain_hint || ""}</span>
-                ${furthestHtml}
-                <button class="thud-btn ${TacticalEngine.polarOpen ? "active" : ""}" id="thud-polar-btn">📊 Polar</button>
-                <button class="thud-btn" id="thud-collapse" title="Minimize HUD">▴</button>
-            </div>
-            <div class="thud-row">
+            <div class="thud-bar">
+                <button class="thud-btn" id="thud-home-btn" title="Center on Local Receiver">🎯</button>
+                <button class="thud-btn rf-pill ${TacticalEngine.rfPopoverOpen ? "active" : ""}" id="thud-rf-btn" title="Click for RF Gain, SNR & 8-Sector Polar Range">
+                    📡 <b>${bench.max_range_nm || "--"} NM</b> · <b>${bench.msg_rate || "--"}</b>/s ▾
+                </button>
+                <span class="thud-sep"></span>
                 <button class="thud-btn ${f === "ALL" ? "active" : ""}" data-filter="ALL">ALL</button>
-                <button class="thud-btn ${f === "MIL" ? "active" : ""}" data-filter="MIL">⚔️ MIL (${milCount})</button>
-                <button class="thud-btn ${f === "NPAS" ? "active" : ""}" data-filter="NPAS">🚓 NPAS (${npasCount})</button>
-                <button class="thud-btn ${f === "HEMS_SAR" ? "active" : ""}" data-filter="HEMS_SAR">🚁 HEMS/SAR (${hemsSarCount})</button>
-                <button class="thud-btn ${f === "LOCAL_ONLY" ? "active" : ""}" data-filter="LOCAL_ONLY">📡 LOCAL ONLY</button>
-                <button class="thud-btn ${TacticalEngine.augmentEnabled ? "active" : ""}" id="thud-aug-toggle">🌐 Augment: ${TacticalEngine.augmentEnabled ? "ON" : "OFF"}</button>
+                <button class="thud-btn ${f === "MIL" ? "active" : ""}" data-filter="MIL">⚔️ ${milCount}</button>
+                <button class="thud-btn ${f === "NPAS" ? "active" : ""}" data-filter="NPAS">🚓 ${npasCount}</button>
+                <button class="thud-btn ${f === "HEMS_SAR" ? "active" : ""}" data-filter="HEMS_SAR">🚁 ${hemsSarCount}</button>
+                <button class="thud-btn ${f === "LOCAL_ONLY" ? "active" : ""}" data-filter="LOCAL_ONLY" title="Show only aircraft heard directly by your local antenna">📡 Local</button>
+                <button class="thud-btn ${TacticalEngine.augmentEnabled ? "active" : ""}" id="thud-aug-toggle" title="Toggle Hybrid MLAT / Open-Data Augmentation">🌐 Aug</button>
+                <span class="thud-sep"></span>
+                <button class="thud-btn ${TacticalEngine.airportsPanelOpen ? "active" : ""}" id="thud-apt-btn" title="Open Interactive Airport Arrivals/Departures & METAR Board">
+                    ✈ Airports${totalAirportMovements > 0 ? " (" + totalAirportMovements + ")" : ""}
+                </button>
+                ${tacList.length > 0 ? `<button class="thud-btn tactical-pill ${TacticalEngine.tacPopoverOpen ? "active" : ""}" id="thud-tac-btn">⚡ Tactical (${tacList.length}) ▾</button>` : ""}
+                <span class="thud-sep"></span>
+                <select class="thud-select" id="thud-map-select" title="Switch Base Map">${mapOpts}</select>
+                <button class="thud-btn ${TacticalEngine.splitCompare ? "active" : ""}" id="thud-split-btn" title="Compare Two Maps Side-by-Side">⚖️</button>
             </div>
-            ${mapRowsHtml}
-            ${tacTickerHtml}
-            ${polarHtml}
+            ${rfPopoverHtml}
+            ${tacPopoverHtml}
         `;
 
         // Wire event listeners
@@ -1453,24 +1641,27 @@
                 recenterToSite(true);
             };
         }
-        const radarBtn = document.getElementById("thud-radar-btn");
-        if (radarBtn) {
-            radarBtn.onclick = function () {
-                TacticalEngine.radarScopeEnabled = !TacticalEngine.radarScopeEnabled;
+        const rfBtn = document.getElementById("thud-rf-btn");
+        if (rfBtn) {
+            rfBtn.onclick = function () {
+                TacticalEngine.rfPopoverOpen = !TacticalEngine.rfPopoverOpen;
+                if (TacticalEngine.rfPopoverOpen) TacticalEngine.tacPopoverOpen = false;
                 renderHud();
             };
         }
-        const colBtn = document.getElementById("thud-collapse");
-        if (colBtn) {
-            colBtn.onclick = function () {
-                TacticalEngine.hudCollapsed = true;
+        const tacBtn = document.getElementById("thud-tac-btn");
+        if (tacBtn) {
+            tacBtn.onclick = function () {
+                TacticalEngine.tacPopoverOpen = !TacticalEngine.tacPopoverOpen;
+                if (TacticalEngine.tacPopoverOpen) TacticalEngine.rfPopoverOpen = false;
                 renderHud();
             };
         }
-        const polBtn = document.getElementById("thud-polar-btn");
-        if (polBtn) {
-            polBtn.onclick = function () {
-                TacticalEngine.polarOpen = !TacticalEngine.polarOpen;
+        const aptBtn = document.getElementById("thud-apt-btn");
+        if (aptBtn) {
+            aptBtn.onclick = function () {
+                TacticalEngine.airportsPanelOpen = !TacticalEngine.airportsPanelOpen;
+                renderAirportsPanel();
                 renderHud();
             };
         }
@@ -1486,6 +1677,12 @@
                 TacticalEngine.augmentEnabled = !TacticalEngine.augmentEnabled;
                 if (typeof refreshFilter === "function") refreshFilter();
                 renderHud();
+            };
+        }
+        const mapSel = document.getElementById("thud-map-select");
+        if (mapSel) {
+            mapSel.onchange = function () {
+                switchBaseMap(this.value);
             };
         }
         const splitBtn = document.getElementById("thud-split-btn");
@@ -1504,32 +1701,6 @@
             };
         }
 
-        const mapBtns = container.querySelectorAll("[data-map]");
-        for (let i = 0; i < mapBtns.length; i++) {
-            mapBtns[i].onclick = function () {
-                switchBaseMap(this.getAttribute("data-map"));
-            };
-        }
-
-        const leftSplitBtns = container.querySelectorAll("[data-split-left]");
-        for (let i = 0; i < leftSplitBtns.length; i++) {
-            leftSplitBtns[i].onclick = function () {
-                TacticalEngine.splitLeftMap = this.getAttribute("data-split-left");
-                applyMapVisibility();
-                renderHud();
-            };
-        }
-
-        const rightSplitBtns = container.querySelectorAll("[data-split-right]");
-        for (let i = 0; i < rightSplitBtns.length; i++) {
-            rightSplitBtns[i].onclick = function () {
-                TacticalEngine.splitRightMap = this.getAttribute("data-split-right");
-                MapType_tar1090 = loStore["MapType_tar1090"] = TacticalEngine.splitRightMap;
-                applyMapVisibility();
-                renderHud();
-            };
-        }
-
         const tacBtns = container.querySelectorAll("[data-fhex]");
         for (let i = 0; i < tacBtns.length; i++) {
             tacBtns[i].onclick = function () {
@@ -1541,7 +1712,7 @@
         }
     }
 
-    // 7. Poll data/augmented.json and refresh airframe shapes + left panel header
+    // 8. Poll data/augmented.json and refresh airframe shapes + panels
     function pollAugmentedData() {
         updateLeftAircraftPanelBadge();
 
@@ -1615,7 +1786,6 @@
             lopaStore["CenterLat"] = SiteLat;
             lopaStore["CenterLon"] = SiteLon;
         }
-        if (typeof drawSiteCircle === "function") drawSiteCircle();
         if (typeof createLocationDot === "function") createLocationDot();
         if (typeof OLMap !== "undefined" && typeof ol !== "undefined") {
             const proj = ol.proj.fromLonLat([SiteLon, SiteLat]);
@@ -1636,7 +1806,7 @@
 
         setTimeout(function () {
             applyDarkAvionicsTheme();
-            initRadarScopeOverlay();
+            initMapCanvasOverlay();
             if (typeof SiteLat === "number" && typeof SiteLon === "number") {
                 const key = `${SiteLat.toFixed(4)},${SiteLon.toFixed(4)}`;
                 if (typeof loStore === "undefined" || loStore["site_receiver_init"] !== key) {

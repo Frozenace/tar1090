@@ -500,13 +500,11 @@ DefaultZoomLvl   = 9.2;
 // SiteLat & SiteLon are loaded automatically from /run/readsb/receiver.json
 SiteShow = true;
 SiteName = "Local ADS-B Receiver";
-SiteCircles = true;
-SiteCirclesDistances = [25, 50, 75, 100, 125];
-SiteCirclesColors = ['#3b82f6', '#2563eb', '#1d4ed8', '#06b6d4', '#f59e0b'];
+SiteCircles = false;
 
 actual_range_show = true;
 actual_range_outline_color = '#06b6d4';
-actual_range_outline_width = 2.0;
+actual_range_outline_width = 1.6;
 
 // High-visibility icons, trails, and labels for 800x480 touchscreen
 iconScale = 1.3;

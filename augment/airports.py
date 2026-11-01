@@ -15,13 +15,16 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-# icao, name, lat, lon, runway axis (deg true, approx.), has_metar
+# icao, name, lat, lon, runway axis (deg true, approx.)
 AIRPORTS = [
     ("EGSS", "London Stansted", 51.8850, 0.2350, 40),
-    ("EGMC", "Southend", 51.5714, 0.6956, 50),
+    ("EGMC", "London Southend", 51.5714, 0.6956, 50),
     ("EGGW", "London Luton", 51.8747, -0.3683, 80),
     ("EGSC", "Cambridge", 52.2050, 0.1750, 50),
     ("EGLC", "London City", 51.5053, 0.0553, 90),
+    ("EGLL", "London Heathrow", 51.4700, -0.4543, 90),
+    ("EGKK", "London Gatwick", 51.1481, -0.1903, 80),
+    ("EGSH", "Norwich", 52.6758, 1.2828, 90),
     ("EGWU", "RAF Northolt", 51.5530, -0.4182, 70),
     ("EGUL", "RAF Lakenheath", 52.4093, 0.5610, 60),
     ("EGUN", "RAF Mildenhall", 52.3619, 0.4864, 110),
@@ -152,28 +155,38 @@ def build_status(site_lat: float, site_lon: float, aircraft: List[Dict[str, Any]
         trk = ac.get("track")
         gs = ac.get("gs") if isinstance(ac.get("gs"), (int, float)) else 0
 
-        best = None  # (dist, icao, bucket)
+        best = None  # (score_dist, dist, icao, bucket)
         for icao, _n, alat, alon, _ax in AIRPORTS:
             d, b_to = _dist_bearing(lat, lon, alat, alon)  # bearing aircraft -> airport
             bucket = None
-            if on_ground and d <= 2.5:
+            if (on_ground and d <= 3.0) or (not on_ground and d <= 2.0 and alt <= 450 and gs < 70):
                 bucket = "ground"
-            elif not on_ground and d <= 4 and alt <= 2000:
-                bucket = "local"
-            elif not on_ground and d <= 30 and alt <= 6000 and trk is not None and gs > 60:
-                if rate < -200 and _adiff(trk, b_to) <= 45:
+            elif not on_ground and d <= 32 and alt <= 9500 and trk is not None and gs > 60:
+                to_diff = _adiff(trk, b_to)
+                away_diff = _adiff(trk, (b_to + 180) % 360)
+                if (rate <= -150 and to_diff <= 50) or (d <= 14 and alt <= 4500 and to_diff <= 22 and rate <= 100):
                     bucket = "inbound"
-                elif rate > 300 and d <= 15 and _adiff(trk, (b_to + 180) % 360) <= 50:
+                elif rate >= 250 and d <= 22 and away_diff <= 60:
                     bucket = "departing"
-            if bucket and (best is None or d < best[0]):
-                best = (d, icao, bucket)
+            if not bucket and not on_ground and d <= 5.5 and alt <= 3200:
+                bucket = "local"
+            if bucket:
+                # Prefer closer airport; give strong alignment bonus for inbound/departing
+                score = d
+                if best is None or score < best[0]:
+                    best = (score, d, icao, bucket)
         if best:
-            d, icao, bucket = best
+            _sc, d, icao, bucket = best
             buckets[icao][bucket].append({
                 "hex": str(ac.get("hex", "")).lower(),
                 "flight": str(ac.get("flight", "")).strip() or str(ac.get("r", "")).strip() or str(ac.get("hex", "")).upper(),
-                "type": ac.get("t", ""),
+                "reg": str(ac.get("r", "")).strip(),
+                "type": str(ac.get("t", "")).strip(),
+                "desc": str(ac.get("desc", "")).strip(),
                 "alt": alt,
+                "gs": round(gs) if gs else None,
+                "vr": round(rate) if rate else 0,
+                "trk": round(trk) if isinstance(trk, (int, float)) else None,
                 "dst_nm": round(d, 1),
                 "lat": lat,
                 "lon": lon,
