@@ -79,7 +79,7 @@
                 }
             }
 
-            if (srv && (srv.category === "HYBRID" || srv.category === "BLINDSPOT")) {
+            if (srv && (srv.category === "HYBRID" || srv.category === "BLINDSPOT" || srv.category === "OGN")) {
                 return {
                     category: srv.category,
                     badge: srv.badge || srv.category,
@@ -784,6 +784,38 @@
         disableConcentricRangeCircles();
     }
 
+    const photoCache = {};
+
+    function ensureAircraftPhoto(hex) {
+        if (!hex || photoCache[hex] !== undefined) return;
+        photoCache[hex] = { loading: true, src: "", credit: "" };
+        fetch(`https://api.planespotters.net/pub/photos/hex/${encodeURIComponent(hex)}`)
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                const ph = d && d.photos && d.photos[0];
+                const img = ph && ((ph.thumbnail_large && ph.thumbnail_large.src) || (ph.thumbnail && ph.thumbnail.src));
+                if (img) {
+                    photoCache[hex] = { loading: false, src: img, credit: ph.photographer ? `📷 ${ph.photographer}` : "" };
+                    updateLeftAircraftPanelBadge();
+                    return null;
+                }
+                return fetch(`https://hexdb.io/hex-image-thumb?hex=${encodeURIComponent(hex)}`)
+                    .then(function (r2) { return r2.ok ? r2.text() : ""; })
+                    .then(function (txt) {
+                        const url = (txt || "").trim();
+                        if (url && url.startsWith("http")) {
+                            photoCache[hex] = { loading: false, src: url, credit: "HexDB" };
+                        } else {
+                            photoCache[hex] = { loading: false, src: "", credit: "" };
+                        }
+                        updateLeftAircraftPanelBadge();
+                    });
+            })
+            .catch(function () {
+                photoCache[hex] = { loading: false, src: "", credit: "" };
+            });
+    }
+
     function updateLeftAircraftPanelBadge() {
         const infoBlock = document.getElementById("selected_infoblock");
         if (!infoBlock || infoBlock.style.display === "none" || typeof SelectedPlane === "undefined" || !SelectedPlane) {
@@ -801,6 +833,13 @@
         }
 
         const p = SelectedPlane;
+        const hx = String(p.icao || "").toLowerCase();
+        ensureAircraftPhoto(hx);
+        const phInfo = photoCache[hx];
+        const photoHtml = (phInfo && phInfo.src)
+            ? `<div style="margin-top:5px;position:relative;border-radius:6px;overflow:hidden;border:1px solid rgba(148,163,184,0.22);"><img src="${phInfo.src}" style="width:100%;max-height:110px;object-fit:cover;display:block;" alt=""><span style="position:absolute;right:4px;bottom:3px;background:rgba(11,17,32,0.82);color:#cbd5e1;font-size:8.5px;padding:1px 4px;border-radius:3px;">${phInfo.credit}</span></div>`
+            : "";
+
         const cat = p.tacticalCategory || (p.uat ? "AUGMENTED" : "LOCAL RF");
         const col = p.tacticalColor || (p.uat ? "#a855f7" : "#10b981");
         const badgeText = p.tacticalLabel || (p.uat ? "Open-Data Augmented" : "Local Antenna RF");
@@ -821,6 +860,7 @@
             <div class="avionics-meta">${regText} ${typeCode ? "· " + typeCode : ""}</div>
             ${routeCode ? `<div class="avionics-meta" style="color:#34d399;margin-top:2px;">✈ ${routeCode}${routeVerb ? " · " + routeVerb : ""}</div>` : ""}
             ${opText ? `<div class="avionics-op">${opText}</div>` : ""}
+            ${photoHtml}
         `;
         if (nextBannerHtml !== lastBannerHtml) {
             lastBannerHtml = nextBannerHtml;

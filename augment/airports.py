@@ -176,6 +176,34 @@ def _fetch_routes_batch(to_query: List[Dict[str, Any]]) -> None:
                     "dest_loc": dest_loc,
                     "expires": now + ROUTE_CACHE_TTL_S,
                 }
+        # Fallback to hexdb.io/api/v1/route/icao/{cs} for up to 3 unresolved callsigns per batch
+        hexdb_checks = 0
+        for q in to_query:
+            cs = q["callsign"]
+            if cs in parsed or hexdb_checks >= 3:
+                continue
+            hexdb_checks += 1
+            try:
+                hres = _http_json(f"https://hexdb.io/api/v1/route/icao/{cs}", timeout=3.0)
+                rt_str = str(hres.get("route") or "").strip().upper()
+                if "-" in rt_str:
+                    parts = [p.strip() for p in rt_str.split("-") if p.strip()]
+                    if len(parts) >= 2:
+                        o_ic, d_ic = parts[0], parts[-1]
+                        parsed[cs] = {
+                            "route_iata": f"{o_ic}→{d_ic}",
+                            "route_icao": f"{o_ic}-{d_ic}",
+                            "orig_iata": o_ic,
+                            "orig_icao": o_ic,
+                            "orig_loc": o_ic,
+                            "dest_iata": d_ic,
+                            "dest_icao": d_ic,
+                            "dest_loc": d_ic,
+                            "expires": now + ROUTE_CACHE_TTL_S,
+                        }
+            except Exception:
+                pass
+
         with _lock:
             for q in to_query:
                 cs = q["callsign"]

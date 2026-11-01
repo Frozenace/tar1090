@@ -24,6 +24,7 @@ import urllib.request
 from typing import Dict, List, Any, Optional, Tuple
 
 import airports as airports_mod
+import ogn_opensky
 
 # Force IPv4 resolution so urllib doesn't hang on dead IPv6 routes
 _orig_getaddrinfo = socket.getaddrinfo
@@ -52,12 +53,10 @@ def load_site_coords() -> Tuple[float, float]:
 
 SITE_LAT, SITE_LON = load_site_coords()
 
-# Parallel Multi-Feed Open ADS-B + MLAT + Dedicated Military Endpoints
+# Parallel Multi-Feed Open ADS-B + MLAT Endpoints (200 NM regional feeds already include all MIL/LADD/PIA flags)
 PARALLEL_ENDPOINTS = [
     ("adsb.fi", f"https://opendata.adsb.fi/api/v2/lat/{SITE_LAT}/lon/{SITE_LON}/dist/200", False),
-    ("adsb.lol", f"https://api.adsb.lol/v2/point/{SITE_LAT}/lon/{SITE_LON}/200" if False else f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200", False),
-    ("adsb.lol-mil", "https://api.adsb.lol/v2/mil", True),
-    ("adsb.fi-mil", "https://opendata.adsb.fi/api/v2/mil", True),
+    ("adsb.lol", f"https://api.adsb.lol/v2/point/{SITE_LAT}/{SITE_LON}/200", False),
 ]
 
 PLANE_ALERT_CSV = os.environ.get("PLANE_ALERT_CSV", "/usr/local/share/tar1090/plane-alert/plane-alert-db.csv")
@@ -375,6 +374,40 @@ def fetch_open_feeds() -> Dict[str, Dict[str, Any]]:
     return merged
 
 
+def _merge_supplementary_into_open(base_open: Dict[str, Dict[str, Any]], now: float) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Fuse live OGN/FLARM APRS-IS stream, OpenSky Network, and HexDB metadata into the open feed pool."""
+    merged = {k: dict(v) for k, v in base_open.items()}
+    ogn_map, osky_map, extra_sources = ogn_opensky.get_supplementary_aircraft(now)
+
+    for src_map in (osky_map, ogn_map):
+        for hx, ac in src_map.items():
+            lat = ac.get("lat")
+            lon = ac.get("lon")
+            if lat is None or lon is None:
+                continue
+            _, d_nm, brng = dist_bearing(SITE_LAT, SITE_LON, float(lat), float(lon))
+            if d_nm > 220.0:
+                continue
+            ac["r_dst"] = round(d_nm, 2)
+            ac["r_dir"] = round(brng, 1)
+            prev = merged.get(hx)
+            if not prev:
+                merged[hx] = ac
+            else:
+                for k in ("r", "t", "desc", "ownOp", "flight", "squawk"):
+                    if not prev.get(k) and ac.get(k):
+                        prev[k] = ac[k]
+                if float(ac.get("seen_pos", 99.0) or 99.0) < float(prev.get("seen_pos", 99.0) or 99.0):
+                    prev["lat"] = ac["lat"]
+                    prev["lon"] = ac["lon"]
+                    prev["seen_pos"] = ac["seen_pos"]
+                    prev["r_dst"] = ac["r_dst"]
+                    prev["r_dir"] = ac["r_dir"]
+
+    all_sources = list(_active_feed_sources) + [s for s in extra_sources if s not in _active_feed_sources]
+    return merged, all_sources
+
+
 def refresh_open_feeds_async() -> None:
     """Refresh fused open feeds in a background thread so the 2s loop never blocks."""
     global _open_fetch_running, _last_open_fetch_ts, _cached_open_feeds
@@ -493,6 +526,7 @@ def compute_benchmark_stats() -> Dict[str, Any]:
 
 def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
     now_ts = time.time()
+    cached_open, all_active_sources = _merge_supplementary_into_open(cached_open, now_ts)
     local_ac_list: List[Dict[str, Any]] = []
     try:
         with open(os.path.join(READSB_DIR, "aircraft.json"), "r") as f:
@@ -534,10 +568,11 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
         else:
             local_mode_s_only += 1
 
-        # Enrich local aircraft with open feed metadata (reg, type, dbFlags) for classification
+        # Enrich local aircraft with open feed + HexDB metadata (reg, type, dbFlags) for classification
         open_ac = cached_open.get(hx, {})
         merged_meta = dict(open_ac)
         merged_meta.update(ac)
+        ogn_opensky.enrich_from_hexdb(hx, merged_meta)
         cls = classify_aircraft(merged_meta)
 
         # Check if this local Mode-S-only plane can get its GPS position from Open MLAT/ADS-B!
@@ -598,20 +633,21 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
                 "lat": ac.get("lat"),
                 "lon": ac.get("lon"),
             })
-        elif open_ac:
-            # Pass along enriched registration/type for local planes
+        elif merged_meta.get("r") or merged_meta.get("t"):
+            # Pass along enriched registration/type for local planes (from open feeds or HexDB)
             classifications[hx] = {
                 "category": "LOCAL",
                 "badge": "LOCAL",
                 "label": "Local Antenna",
                 "color": "#22c55e",
-                "reg": str(open_ac.get("r", "")).strip(),
-                "type": str(open_ac.get("t", "")).strip(),
-                "desc": str(open_ac.get("desc", "")).strip(),
+                "reg": str(merged_meta.get("r", "")).strip(),
+                "type": str(merged_meta.get("t", "")).strip(),
+                "desc": str(merged_meta.get("desc", "")).strip(),
+                "ownOp": str(merged_meta.get("ownOp", "")).strip(),
                 "source": "LOCAL",
             }
 
-    # 2. Scan Open-Data feed for Tactical aircraft (NPAS, HEMS, SAR, MIL) & Blind-Spot augmentation
+    # 2. Scan Open-Data feed for Tactical aircraft (NPAS, HEMS, SAR, MIL), OGN/FLARM Gliders/GA & Blind-Spot augmentation
     for hx, open_ac in cached_open.items():
         if hx in local_by_hex:
             continue
@@ -620,13 +656,14 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
         if open_ac.get("alt_baro") == "ground":
             continue
 
+        ogn_opensky.enrich_from_hexdb(hx, open_ac)
         cls = classify_aircraft(open_ac)
         r_dst = float(open_ac.get("r_dst", 999.0) or 999.0)
         r_dir = float(open_ac.get("r_dir", 0.0) or 0.0)
 
         # Include all airborne Tactical aircraft (NPAS, HEMS, SAR, MIL) within 180 NM
         if cls and r_dst <= 180.0:
-            aug_ac = dict(open_ac)
+            aug_ac = {k: v for k, v in open_ac.items() if not k.startswith("_")}
             aug_ac["seen"] = min(float(open_ac.get("seen", 1.0) or 1.0), 5.0)
             aug_ac["seen_pos"] = min(float(open_ac.get("seen_pos", 1.0) or 1.0), 5.0)
             aug_ac["aug_source"] = "OPEN_TACTICAL"
@@ -649,9 +686,26 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
                 "lat": open_ac.get("lat"),
                 "lon": open_ac.get("lon"),
             })
+        # Include OGN / FLARM / PilotAware / SafeSky Gliders & Light GA within 120 NM
+        elif open_ac.get("_ogn_only") and r_dst <= 120.0:
+            aug_ac = {k: v for k, v in open_ac.items() if not k.startswith("_")}
+            aug_ac["seen"] = min(float(open_ac.get("seen", 1.0) or 1.0), 5.0)
+            aug_ac["seen_pos"] = min(float(open_ac.get("seen_pos", 1.0) or 1.0), 5.0)
+            aug_ac["aug_source"] = "OGN_FLARM"
+            augmented_aircraft.append(aug_ac)
+            classifications[hx] = {
+                "category": "OGN",
+                "badge": "OGN",
+                "label": f"OGN / {open_ac.get('_ogn_prefix', 'FLR')} Glider & GA",
+                "color": "#10b981",
+                "reg": str(open_ac.get("r", "")).strip(),
+                "type": str(open_ac.get("t", "GLID")).strip(),
+                "desc": str(open_ac.get("desc", "OGN/FLARM Light Aircraft")).strip(),
+                "source": "OGN_FLARM",
+            }
         # Also include aircraft inside the NW roof blind-spot (285°-355°) within 65 NM
         elif 285.0 <= r_dir <= 355.0 and r_dst <= 65.0:
-            aug_ac = dict(open_ac)
+            aug_ac = {k: v for k, v in open_ac.items() if not k.startswith("_")}
             aug_ac["seen"] = min(float(open_ac.get("seen", 1.0) or 1.0), 5.0)
             aug_ac["seen_pos"] = min(float(open_ac.get("seen_pos", 1.0) or 1.0), 5.0)
             aug_ac["aug_source"] = "OPEN_BLINDSPOT"
@@ -669,6 +723,7 @@ def run_cycle(cached_open: Dict[str, Dict[str, Any]]) -> None:
 
     tactical_list.sort(key=lambda x: x.get("dst_nm", 999.0))
     bench = compute_benchmark_stats()
+    bench["feed_sources"] = all_active_sources
     bench["local_with_pos"] = local_with_pos
     bench["local_mode_s_only"] = local_mode_s_only
     bench["open_unique_aircraft"] = len(cached_open)
@@ -929,6 +984,7 @@ def update_findings_log(
 def main() -> None:
     global _cached_open_feeds, _last_open_fetch_ts
     once = "--once" in sys.argv
+    ogn_opensky.start_background_workers(SITE_LAT, SITE_LON)
     # Initial synchronous seed so first cycle has full multi-feed data
     _cached_open_feeds = fetch_open_feeds()
     _last_open_fetch_ts = time.time()
